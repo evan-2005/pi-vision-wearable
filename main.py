@@ -75,7 +75,8 @@ HOLD_TIME_S     = 1.0        # press longer than this = long press (OCR)
 HEADSET_MAC = os.environ.get("FYP_HEADSET_MAC", "3C:B0:ED:B6:18:A9")
 
 # Audio output device for aplay, resolved at startup by resolve_audio_device().
-# The plug: wrapper resamples Piper's 22.05 kHz output to the 48 kHz A2DP link.
+# Speech plays through the bluealsa PCM directly (no plug: wrapper - see
+# bluealsa_device()). Piper's 22.05 kHz mono output plays as-is over A2DP.
 # Priority: FYP_AUDIO_DEVICE override > whichever headset is connected
 # (auto-detected) > HEADSET_MAC fallback. This lets the user swap between
 # paired earphones - whichever is powered on and connected gets used.
@@ -426,8 +427,14 @@ def detect_headset_mac() -> "str | None":
 
 
 def bluealsa_device(mac: str) -> str:
-    """ALSA device string for playing to a headset over BlueALSA A2DP."""
-    return f"plug:bluealsa:DEV={mac},PROFILE=a2dp"
+    """ALSA device string for playing to a headset over BlueALSA A2DP.
+
+    No `plug:` wrapper: the bluealsa PCM plays Piper's 22.05 kHz mono output
+    directly (verified with `aplay -D bluealsa:DEV=...`). Prefixing `plug:`
+    breaks parsing on this bluez-alsa build - ALSA reads the comma-separated
+    args as the plug plugin's own parameters and fails with "Unknown PCM".
+    """
+    return f"bluealsa:DEV={mac},PROFILE=a2dp"
 
 
 def resolve_audio_device() -> "str | None":
