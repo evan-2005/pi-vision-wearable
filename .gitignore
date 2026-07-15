@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Model / voice artifacts (large; live in ~/fyp on the Pi, not in the repo)
+*.onnx
+*.ncnn.bin
+*.ncnn.param
+
+# Runtime captures / scratch
+/tmp/
+capture.jpg
+speech.wav
+
+# Editor / tooling
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
