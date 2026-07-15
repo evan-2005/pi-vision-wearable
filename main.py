@@ -70,19 +70,18 @@ USE_GPIO_BUTTON = os.environ.get("FYP_USE_GPIO", "0") == "1"
 BUTTON_GPIO     = 17
 HOLD_TIME_S     = 1.0        # press longer than this = long press (OCR)
 
-# Bluetooth headset (Nothing Ear (a)); validated 2026-07-15.
+# Bluetooth headset fallback MAC (Nothing Ear (a)); used only when auto-detect
+# can't find a connected headset. Override with FYP_HEADSET_MAC.
 HEADSET_MAC = os.environ.get("FYP_HEADSET_MAC", "3C:B0:ED:B6:18:A9")
 
-# Audio output device for aplay.
-# The plug: wrapper resamples Piper's 22.05 kHz output to the 48 kHz
-# A2DP link. If your buds played fine WITHOUT plug:, drop the wrapper.
-# Set FYP_AUDIO_DEVICE=default to use the 3.5mm/HDMI output for bench tests.
-AUDIO_DEVICE = os.environ.get(
-    "FYP_AUDIO_DEVICE",
-    f"plug:bluealsa:DEV={HEADSET_MAC},PROFILE=a2dp",
-)
-if AUDIO_DEVICE.lower() in ("default", "none", ""):
-    AUDIO_DEVICE = None
+# Audio output device for aplay, resolved at startup by resolve_audio_device().
+# The plug: wrapper resamples Piper's 22.05 kHz output to the 48 kHz A2DP link.
+# Priority: FYP_AUDIO_DEVICE override > whichever headset is connected
+# (auto-detected) > HEADSET_MAC fallback. This lets the user swap between
+# paired earphones - whichever is powered on and connected gets used.
+# Set FYP_AUDIO_DEVICE=default to force the onboard 3.5mm/HDMI output.
+_AUDIO_OVERRIDE = os.environ.get("FYP_AUDIO_DEVICE")
+AUDIO_DEVICE = None   # resolved in main() before any speech
 
 # ----------------------------------------------------------------------------
 # Speech
@@ -404,7 +403,58 @@ def bluetooth_connected(mac: str) -> bool:
         return False
 
 
+def detect_headset_mac() -> "str | None":
+    """MAC of a currently-connected Bluetooth device, or None.
+
+    Lets the user swap between paired headsets without editing config:
+    whichever one is powered on and connected is the one we use. On a
+    wearable the only paired device is the headset, so "connected" == it.
+    """
+    try:
+        result = subprocess.run(
+            ["bluetoothctl", "devices", "Connected"],
+            capture_output=True, timeout=10, text=True,
+        )
+        # Lines look like: "Device 3C:B0:ED:B6:18:A9 Nothing Ear (a)"
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == "Device":
+                return parts[1]
+    except Exception:
+        pass  # old bluez without the "Connected" filter, or bluetoothctl absent
+    return None
+
+
+def bluealsa_device(mac: str) -> str:
+    """ALSA device string for playing to a headset over BlueALSA A2DP."""
+    return f"plug:bluealsa:DEV={mac},PROFILE=a2dp"
+
+
+def resolve_audio_device() -> "str | None":
+    """Pick the ALSA device speech plays through, in priority order.
+
+    1. FYP_AUDIO_DEVICE override ("default"/"none"/"" -> onboard 3.5mm/HDMI).
+    2. Whichever Bluetooth headset is currently connected (auto-detected).
+    3. HEADSET_MAC fallback, so it still tries if detection is unavailable.
+    """
+    if _AUDIO_OVERRIDE is not None:
+        if _AUDIO_OVERRIDE.lower() in ("default", "none", ""):
+            return None
+        return _AUDIO_OVERRIDE
+    mac = detect_headset_mac()
+    if mac:
+        print(f"[AUDIO] using connected headset {mac}")
+        return bluealsa_device(mac)
+    print(f"[AUDIO] no connected headset detected; "
+          f"falling back to {HEADSET_MAC}")
+    return bluealsa_device(HEADSET_MAC)
+
+
 def main():
+    # Resolve the audio sink before anything tries to speak.
+    global AUDIO_DEVICE
+    AUDIO_DEVICE = resolve_audio_device()
+
     # --- preflight ---
     problems = []
     if not MODEL_PATH.exists():
@@ -421,8 +471,10 @@ def main():
     # Warn (don't abort) if the Bluetooth sink isn't up: audio would go
     # nowhere, but keyboard-mode bench testing may deliberately use 3.5mm.
     if AUDIO_DEVICE and "bluealsa" in AUDIO_DEVICE:
-        if not bluetooth_connected(HEADSET_MAC):
-            print(f"[PREFLIGHT] WARNING: headset {HEADSET_MAC} not connected;"
+        mac_match = re.search(r"DEV=([0-9A-Fa-f:]+)", AUDIO_DEVICE)
+        target_mac = mac_match.group(1) if mac_match else HEADSET_MAC
+        if not bluetooth_connected(target_mac):
+            print(f"[PREFLIGHT] WARNING: headset {target_mac} not connected;"
                   " speech will fail until it reconnects.")
 
     print("[INIT] loading YOLO NCNN model...")
