@@ -60,7 +60,11 @@ MAX_SPOKEN_CLASSES = 4       # don't overwhelm the listener
 # OCR tunables
 OCR_PSM            = 6        # tesseract page segmentation mode (assume a block)
 OCR_MIN_CONF       = 40       # drop words tesseract is less than this % sure of
-OSD_MIN_CONFIDENCE = 2.0      # ignore orientation guesses weaker than this
+# Orientations to try when reading text. We OCR each and keep the one that
+# reads most confidently, instead of trusting Tesseract's OSD (which kept
+# confidently flipping upright signs 180 degrees). Add 90/270 if the camera
+# can ever be mounted sideways; for a fixed chest mount 0 vs 180 is enough.
+OCR_ORIENTATIONS   = (0, 180)
 
 USE_GPIO_BUTTON = os.environ.get("FYP_USE_GPIO", "0") == "1"
 BUTTON_GPIO     = 17
@@ -187,30 +191,18 @@ def preprocess_otsu(img_bgr):
     return thresh
 
 
-def auto_rotate(img_bgr):
-    """Use tesseract orientation detection; rotate image upright if needed."""
-    try:
-        osd = pytesseract.image_to_osd(img_bgr)
-        angle = int(re.search(r"Rotate: (\d+)", osd).group(1))
-        conf_match = re.search(r"Orientation confidence: ([\d.]+)", osd)
-        confidence = float(conf_match.group(1)) if conf_match else 0.0
-    except Exception:
-        return img_bgr  # OSD needs enough text; fall back to as-is
-    # OSD misfires on sparse text (e.g. reading "2019" as an upside-down
-    # "6LOZ"), so only trust a rotation the detector is actually sure of.
-    if confidence < OSD_MIN_CONFIDENCE:
-        print(f"[OCR] OSD confidence {confidence:.1f} < {OSD_MIN_CONFIDENCE}; "
-              f"skipping rotation")
+_ROTATIONS = {
+    90:  cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+
+def rotate_image(img_bgr, angle):
+    """Rotate by a multiple of 90 degrees (0 returns the image unchanged)."""
+    if angle == 0:
         return img_bgr
-    rotations = {
-        90:  cv2.ROTATE_90_CLOCKWISE,
-        180: cv2.ROTATE_180,
-        270: cv2.ROTATE_90_COUNTERCLOCKWISE,
-    }
-    if angle in rotations:
-        print(f"[OCR] auto-rotating {angle} degrees")
-        return cv2.rotate(img_bgr, rotations[angle])
-    return img_bgr
+    return cv2.rotate(img_bgr, _ROTATIONS[angle])
 
 
 def clean_ocr_text(text: str) -> str:
@@ -225,42 +217,56 @@ def _alnum_count(text: str) -> int:
     return sum(ch.isalnum() for ch in text)
 
 
-def ocr_confident_words(processed) -> str:
-    """OCR one preprocessed image, keeping only words tesseract is sure of.
+def ocr_scored(processed):
+    """OCR one preprocessed image; return (confidence_score, text).
 
     Uses image_to_data so we can drop low-confidence fragments (conf <
     OCR_MIN_CONF) before they reach TTS. Surviving words are rejoined in
-    reading order, which is the order image_to_data already returns them in.
+    reading order (the order image_to_data returns them in). The score is the
+    summed confidence of the surviving words - upright text produces many
+    confident words and scores high, so it lets us pick the right orientation.
     """
     data = pytesseract.image_to_data(
         processed,
         config=f"--psm {OCR_PSM}",
         output_type=pytesseract.Output.DICT,
     )
-    words = []
+    words, confs = [], []
     for word, conf in zip(data["text"], data["conf"]):
         try:
-            score = float(conf)
+            c = float(conf)
         except (TypeError, ValueError):
             continue          # tesseract uses "-1"/"" for non-text boxes
-        if score >= OCR_MIN_CONF and word.strip():
+        if c >= OCR_MIN_CONF and word.strip():
             words.append(word)
-    return clean_ocr_text(" ".join(words))
+            confs.append(c)
+    return sum(confs), clean_ocr_text(" ".join(words))
+
+
+def _best_over_orientations(frame_bgr, preprocess, label, start_score, start):
+    """Run `preprocess` at each candidate orientation; keep the top scorer."""
+    best_score, best_text, best_pass = start_score, start[0], start[1]
+    for angle in OCR_ORIENTATIONS:
+        score, text = ocr_scored(preprocess(rotate_image(frame_bgr, angle)))
+        print(f"[OCR] {angle:>3} deg / {label}: score={score:.0f} "
+              f"text={text[:40]!r}")
+        if score > best_score:
+            best_score, best_text, best_pass = score, text, f"{angle}/{label}"
+    return best_score, best_text, best_pass
 
 
 def run_ocr(frame_bgr) -> str:
-    frame_bgr = auto_rotate(frame_bgr)
+    # Primary strategy: CLAHE at each orientation, keep the most confident read.
+    # This replaces Tesseract OSD, which kept flipping upright signs 180 deg.
+    score, text, winning_pass = _best_over_orientations(
+        frame_bgr, preprocess_for_ocr, "CLAHE", -1.0, ("", "none"))
 
-    # Primary pass: CLAHE local contrast (best on most real-world captures).
-    text = ocr_confident_words(preprocess_for_ocr(frame_bgr))
-    winning_pass = "CLAHE"
-
-    # Fallback: if CLAHE gave us almost nothing, retry once with plain Otsu.
+    # Fallback: if CLAHE read almost nothing, retry each orientation with a
+    # plain Otsu threshold (recovers clean high-contrast pages CLAHE smears).
     if _alnum_count(text) < 3:
-        print("[OCR] CLAHE pass near-empty; retrying with Otsu threshold")
-        otsu_text = ocr_confident_words(preprocess_otsu(frame_bgr))
-        if _alnum_count(otsu_text) > _alnum_count(text):
-            text, winning_pass = otsu_text, "Otsu"
+        print("[OCR] CLAHE passes near-empty; retrying with Otsu threshold")
+        score, text, winning_pass = _best_over_orientations(
+            frame_bgr, preprocess_otsu, "Otsu", score, (text, winning_pass))
 
     if not text:
         return "No readable text found."
