@@ -12,13 +12,14 @@
 #
 # What this does:
 #   1. apt packages   (tesseract, bluez/bluealsa, python tooling, camera libs)
-#   2. ~/fyp project dir + Python venv (--system-site-packages: REQUIRED so
+#   2. Disables PipeWire's Bluetooth module (it fights BlueALSA for the headset)
+#   3. ~/fyp project dir + Python venv (--system-site-packages: REQUIRED so
 #      the apt-installed picamera2 stays importable inside the venv)
-#   3. pip packages   (ultralytics, ncnn, opencv, pytesseract, piper-tts)
-#   4. YOLOv8n download + NCNN export
-#   5. Piper voice model download (en_US-lessac-medium)
-#   6. Copies main.py into ~/fyp
-#   7. Installs a systemd service (disabled by default; see end of output)
+#   4. pip packages   (ultralytics, ncnn, opencv, pytesseract, piper-tts)
+#   5. YOLOv8n download + NCNN export
+#   6. Piper voice model download (en_US-lessac-medium)
+#   7. Copies main.py into ~/fyp
+#   8. Installs a systemd service (disabled by default; see end of output)
 #
 # What this does NOT do (one-time manual steps):
 #   - Bluetooth pairing: pair/trust/connect your headset via bluetoothctl,
@@ -35,7 +36,7 @@ log()  { echo -e "\n\033[1;32m==> $*\033[0m"; }
 warn() { echo -e "\033[1;33m[warn]\033[0m $*"; }
 
 # -----------------------------------------------------------------------------
-log "1/7 Installing apt packages"
+log "1/8 Installing apt packages"
 # -----------------------------------------------------------------------------
 sudo apt-get update
 sudo apt-get install -y \
@@ -46,7 +47,34 @@ sudo apt-get install -y \
     alsa-utils
 
 # -----------------------------------------------------------------------------
-log "2/7 Creating project directory and virtual environment"
+log "2/8 Disabling PipeWire's Bluetooth handling"
+# -----------------------------------------------------------------------------
+# Raspberry Pi OS ships PipeWire + WirePlumber, which claim any paired headset
+# and park it in HFP/mSBC over a SCO link as the default sink AND source. With
+# BlueALSA also driving the same headset over A2DP you get two concurrent
+# Bluetooth audio links to one device, fighting each other. BlueALSA owns audio
+# here, so take PipeWire out of Bluetooth entirely.
+sudo mkdir -p /etc/wireplumber/wireplumber.conf.d
+sudo tee /etc/wireplumber/wireplumber.conf.d/50-disable-bluez.conf > /dev/null <<'WPEOF'
+# Installed by the FYP wearable installer. BlueALSA drives the headset, so
+# WirePlumber must not also claim it. Delete this file to hand Bluetooth back
+# to PipeWire - and then use one stack or the other, never both.
+wireplumber.profiles = {
+  main = {
+    monitor.bluez = disabled
+    monitor.bluez.seat-monitoring = disabled
+  }
+}
+WPEOF
+
+if XDG_RUNTIME_DIR="/run/user/$(id -u)"    systemctl --user restart wireplumber pipewire-pulse 2>/dev/null; then
+    echo "    wireplumber restarted - Bluetooth is now BlueALSA-only"
+else
+    warn "could not restart wireplumber from here; reboot to apply"
+fi
+
+# -----------------------------------------------------------------------------
+log "3/8 Creating project directory and virtual environment"
 # -----------------------------------------------------------------------------
 mkdir -p "$FYP_DIR/voices"
 
@@ -61,7 +89,7 @@ fi
 source "$VENV/bin/activate"
 
 # -----------------------------------------------------------------------------
-log "3/7 Installing Python packages"
+log "4/8 Installing Python packages"
 # -----------------------------------------------------------------------------
 pip install --upgrade pip
 pip install \
@@ -72,7 +100,7 @@ pip install \
     "piper-tts>=1.4"
 
 # -----------------------------------------------------------------------------
-log "4/7 YOLOv8n -> NCNN export"
+log "5/8 YOLOv8n -> NCNN export"
 # -----------------------------------------------------------------------------
 cd "$FYP_DIR"
 if [ ! -d "$FYP_DIR/yolov8n_ncnn_model" ]; then
@@ -84,7 +112,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "5/7 Downloading Piper voice (en_US-lessac-medium)"
+log "6/8 Downloading Piper voice (en_US-lessac-medium)"
 # -----------------------------------------------------------------------------
 if [ ! -f "$FYP_DIR/voices/en_US-lessac-medium.onnx" ]; then
     cd "$FYP_DIR/voices"
@@ -94,7 +122,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "6/7 Installing main.py"
+log "7/8 Installing main.py"
 # -----------------------------------------------------------------------------
 if [ -f "$REPO_DIR/main.py" ]; then
     cp "$REPO_DIR/main.py" "$FYP_DIR/main.py"
@@ -103,7 +131,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "7/7 Installing systemd service (left disabled)"
+log "8/8 Installing systemd service (left disabled)"
 # -----------------------------------------------------------------------------
 sudo tee /etc/systemd/system/fyp.service > /dev/null <<EOF
 [Unit]
