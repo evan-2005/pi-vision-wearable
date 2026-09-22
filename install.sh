@@ -18,8 +18,8 @@
 #      the apt-installed picamera2 stays importable inside the venv)
 #   5. pip packages   (ultralytics, ncnn, opencv, pytesseract, piper-tts)
 #   6. YOLOv8n download + NCNN export
-#   7. Piper voice model download (en_US-lessac-medium)
-#   8. Copies main.py into ~/fyp
+#   7. Piper voice + feature models (face, emotion, offline speech-to-text)
+#   8. Copies main.py and fypvision/ into ~/fyp
 #   9. Installs a systemd service (disabled by default; see end of output)
 #
 # What this does NOT do (one-time manual steps):
@@ -44,11 +44,12 @@ sudo apt-get install -y \
     python3-pip python3-venv git \
     tesseract-ocr libtesseract-dev \
     bluez bluez-alsa-utils \
+    unzip curl \
     python3-picamera2 rpicam-apps \
     alsa-utils
 
 # -----------------------------------------------------------------------------
-log "2/9 Disabling PipeWire's Bluetooth handling"
+log "2/9 Configuring Bluetooth audio (PipeWire off, HFP on)"
 # -----------------------------------------------------------------------------
 # Raspberry Pi OS ships PipeWire + WirePlumber, which claim any paired headset
 # and park it in HFP/mSBC over a SCO link as the default sink AND source. With
@@ -68,11 +69,29 @@ wireplumber.profiles = {
 }
 WPEOF
 
-if XDG_RUNTIME_DIR="/run/user/$(id -u)"    systemctl --user restart wireplumber pipewire-pulse 2>/dev/null; then
+if XDG_RUNTIME_DIR="/run/user/$(id -u)" \
+   systemctl --user restart wireplumber pipewire-pulse 2>/dev/null; then
     echo "    wireplumber restarted - Bluetooth is now BlueALSA-only"
 else
     warn "could not restart wireplumber from here; reboot to apply"
 fi
+
+# Voice input needs the headset microphone, which exists only over HFP. The Pi
+# acts as the Audio Gateway (hfp-ag), the headset as the hands-free device.
+# A2DP playback is unaffected: main.py never holds the mic open while speaking,
+# because an SCO link plus A2DP music together are what made this headset
+# stutter in the first place.
+sudo mkdir -p /etc/systemd/system/bluealsa.service.d
+sudo tee /etc/systemd/system/bluealsa.service.d/10-hfp.conf > /dev/null <<'HFPEOF'
+# Installed by the FYP wearable installer: adds HFP so the headset mic can be
+# recorded from. Delete this file to return to playback-only Bluetooth.
+[Service]
+ExecStart=
+ExecStart=/usr/bin/bluealsa -S -p a2dp-source -p a2dp-sink -p hfp-ag
+HFPEOF
+sudo systemctl daemon-reload
+sudo systemctl restart bluealsa || warn "bluealsa restart failed; reboot to apply"
+echo "    BlueALSA restarted with HFP enabled (headset mic available)"
 
 # -----------------------------------------------------------------------------
 log "3/9 Stabilising eth0 addressing"
@@ -97,9 +116,14 @@ log "3/9 Stabilising eth0 addressing"
 # SLAAC. To restore it:  sudo nmcli connection modify <conn> ipv6.method auto
 #
 # A Pi has a single ethernet port, so the first 802-3-ethernet profile is it.
-ETH_CONN="$(nmcli -t -f NAME,TYPE connection show 2>/dev/null             | awk -F: '$2 == "802-3-ethernet" { print $1; exit }' || true)"
+ETH_CONN="$(nmcli -t -f NAME,TYPE connection show 2>/dev/null \
+            | awk -F: '$2 == "802-3-ethernet" { print $1; exit }' || true)"
 if [ -n "${ETH_CONN:-}" ]; then
-    if sudo nmcli connection modify "$ETH_CONN"             ipv6.method link-local             ipv4.method auto             ipv4.link-local fallback             ipv4.dhcp-timeout 15 2>/dev/null; then
+    if sudo nmcli connection modify "$ETH_CONN" \
+            ipv6.method link-local \
+            ipv4.method auto \
+            ipv4.link-local fallback \
+            ipv4.dhcp-timeout 15 2>/dev/null; then
         echo "    '$ETH_CONN' now activates without waiting on DHCP"
         sudo nmcli connection up "$ETH_CONN" > /dev/null 2>&1 || true
     else
@@ -133,7 +157,8 @@ pip install \
     ncnn \
     opencv-python \
     pytesseract \
-    "piper-tts>=1.4"
+    "piper-tts>=1.4" \
+    vosk
 
 # -----------------------------------------------------------------------------
 log "6/9 YOLOv8n -> NCNN export"
@@ -148,7 +173,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "7/9 Downloading Piper voice (en_US-lessac-medium)"
+log "7/9 Downloading voice and feature models"
 # -----------------------------------------------------------------------------
 if [ ! -f "$FYP_DIR/voices/en_US-lessac-medium.onnx" ]; then
     cd "$FYP_DIR/voices"
@@ -157,6 +182,47 @@ else
     warn "voice model already present, skipping download"
 fi
 
+# Models for the emotion and voice-command features. Each is optional: the
+# matching feature reports itself unavailable rather than crashing when a file
+# is missing, so a failed download here never breaks the wearable.
+MODEL_DIR="$FYP_DIR/models"
+mkdir -p "$MODEL_DIR"
+cd "$MODEL_DIR"
+
+fetch() {   # fetch <file> <url> <description>
+    if [ -e "$1" ]; then
+        warn "$1 already present, skipping"
+        return 0
+    fi
+    echo "    downloading $3 ..."
+    # Download to .part and rename, so an interrupted transfer is never
+    # mistaken for a complete model on the next run.
+    if curl -sSL -m 600 -o "$1.part" "$2"; then
+        mv "$1.part" "$1"
+    else
+        rm -f "$1.part"
+        warn "could not download $3; that feature will stay disabled"
+    fi
+}
+
+fetch face_detection_yunet_2023mar.onnx \
+    "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx" \
+    "YuNet face detector (230 KB)"
+
+fetch emotion-ferplus-8.onnx \
+    "https://github.com/onnx/models/raw/main/validated/vision/body_analysis/emotion_ferplus/model/emotion-ferplus-8.onnx" \
+    "FER+ emotion classifier (34 MB)"
+
+if [ ! -d vosk-model-small-en-us-0.15 ]; then
+    fetch vosk-small.zip \
+        "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip" \
+        "Vosk offline speech model (40 MB)"
+    [ -f vosk-small.zip ] && { unzip -q vosk-small.zip && rm -f vosk-small.zip; }
+else
+    warn "vosk speech model already present, skipping"
+fi
+cd "$FYP_DIR"
+
 # -----------------------------------------------------------------------------
 log "8/9 Installing main.py"
 # -----------------------------------------------------------------------------
@@ -164,6 +230,15 @@ if [ -f "$REPO_DIR/main.py" ]; then
     cp "$REPO_DIR/main.py" "$FYP_DIR/main.py"
 else
     warn "main.py not found next to install.sh; copy it to $FYP_DIR manually"
+fi
+
+# Feature modules: distance, finder, emotion, currency, voice, reporting.
+if [ -d "$REPO_DIR/fypvision" ]; then
+    rm -rf "$FYP_DIR/fypvision"
+    cp -r "$REPO_DIR/fypvision" "$FYP_DIR/fypvision"
+    echo "    installed fypvision/ feature modules"
+else
+    warn "fypvision/ not found next to install.sh; features will not import"
 fi
 
 # -----------------------------------------------------------------------------
