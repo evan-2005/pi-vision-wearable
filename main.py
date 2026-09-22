@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 from collections import Counter
 from pathlib import Path
 
@@ -43,6 +44,8 @@ from ultralytics import YOLO
 FYP_DIR      = Path.home() / "fyp"
 MODEL_PATH   = FYP_DIR / "yolov8n_ncnn_model"
 SPEECH_WAV   = Path("/tmp/speech.wav")
+# Piper writes SPEECH_WAV; to_a2dp_format() rewrites it here for playback.
+PLAYBACK_WAV = Path("/tmp/speech_playback.wav")
 CAPTURE_JPG  = Path("/tmp/capture.jpg")
 
 # Voice model: look in voices/ first, fall back to the fyp dir itself
@@ -75,14 +78,19 @@ HOLD_TIME_S     = 1.0        # press longer than this = long press (OCR)
 HEADSET_MAC = os.environ.get("FYP_HEADSET_MAC", "3C:B0:ED:B6:18:A9")
 
 # Audio output device for aplay, resolved at startup by resolve_audio_device().
-# Speech plays through the bluealsa PCM directly (no plug: wrapper - see
-# bluealsa_device()). Piper's 22.05 kHz mono output plays as-is over A2DP.
+# Speech is converted to 44.1 kHz stereo before playback - Piper's native
+# 22.05 kHz mono triggers a BlueALSA mono-SBC bug; see to_a2dp_format().
 # Priority: FYP_AUDIO_DEVICE override > whichever headset is connected
 # (auto-detected) > HEADSET_MAC fallback. This lets the user swap between
 # paired earphones - whichever is powered on and connected gets used.
 # Set FYP_AUDIO_DEVICE=default to force the onboard 3.5mm/HDMI output.
 _AUDIO_OVERRIDE = os.environ.get("FYP_AUDIO_DEVICE")
 AUDIO_DEVICE = None   # resolved in main() before any speech
+
+# Target playback format. 44.1 kHz stereo is the universally safe A2DP/SBC
+# configuration; see to_a2dp_format() for why mono is not an option.
+A2DP_RATE     = 44100
+A2DP_CHANNELS = 2
 
 # ----------------------------------------------------------------------------
 # Speech
@@ -107,17 +115,74 @@ def synthesize(text: str) -> bool:
         return False
 
 
+def to_a2dp_format(src: Path, dst: Path) -> Path:
+    """Rewrite a WAV as 44.1 kHz stereo. Returns the path to play.
+
+    Mono SBC is broken in bluez-alsa 4.3.1: a 44.1 kHz mono stream reaches the
+    headset garbled, a 48 kHz mono stream initialises the encoder as
+    "0 Hz ... => 0 bps", and playback can hang outright. A stereo stream of the
+    same bitrate plays cleanly, so we never hand BlueALSA a mono PCM.
+
+    Falls back to the original file if anything here fails - degraded audio
+    beats no audio on an assistive device.
+    """
+    try:
+        with wave.open(str(src), "rb") as w:
+            if w.getsampwidth() != 2:
+                return src                      # not S16; leave it alone
+            rate, channels = w.getframerate(), w.getnchannels()
+            if rate == A2DP_RATE and channels == A2DP_CHANNELS:
+                return src
+            raw = w.readframes(w.getnframes())
+
+        samples = np.frombuffer(raw, dtype="<i2").reshape(-1, channels)
+        if samples.size == 0:
+            return src
+
+        if rate != A2DP_RATE:
+            n_out = int(round(samples.shape[0] * A2DP_RATE / rate))
+            src_ix = np.arange(samples.shape[0])
+            dst_ix = np.linspace(0, samples.shape[0] - 1, n_out)
+            samples = np.stack(
+                [np.interp(dst_ix, src_ix, samples[:, c])
+                 for c in range(channels)], axis=1).astype(np.int16)
+
+        if samples.shape[1] == 1:
+            samples = np.repeat(samples, A2DP_CHANNELS, axis=1)
+        elif samples.shape[1] > A2DP_CHANNELS:
+            samples = samples[:, :A2DP_CHANNELS]
+
+        with wave.open(str(dst), "wb") as out:
+            out.setnchannels(A2DP_CHANNELS)
+            out.setsampwidth(2)
+            out.setframerate(A2DP_RATE)
+            out.writeframes(samples.tobytes())
+        return dst
+    except Exception as e:
+        print(f"[AUDIO] format conversion failed ({e}); playing original")
+        return src
+
+
 def play_wav(path: Path) -> bool:
     """Play a WAV on AUDIO_DEVICE. Returns True on success."""
-    cmd = ["aplay", "-q"]
+    # No -q: aplay's rate/format warnings are the only signal that a stream is
+    # being played at the wrong rate, and suppressing them hid a real bug.
+    cmd = ["aplay"]
     if AUDIO_DEVICE:
         cmd += ["-D", AUDIO_DEVICE]
     cmd.append(str(path))
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=60)
+        # The BlueALSA ALSA plugin is built with debug logging; drop those
+        # lines so a real warning is not buried in per-open chatter.
+        notes = [ln for ln in result.stderr.decode(errors="replace").splitlines()
+                 if ln.strip() and "] D: " not in ln]
         if result.returncode != 0:
             print(f"[AUDIO] aplay exited {result.returncode}: "
-                  f"{result.stderr.decode(errors='replace')[-300:]}")
+                  f"{' | '.join(notes)[-300:]}")
+        else:
+            for ln in notes:
+                print(f"[AUDIO] {ln}")
         return result.returncode == 0
     except Exception as e:
         print(f"[AUDIO] playback failed: {e}")
@@ -128,7 +193,7 @@ def speak(text: str) -> None:
     """Say text out loud (and always print it, for headless debugging)."""
     print(f"[SPEAK] {text}")
     if synthesize(text):
-        play_wav(SPEECH_WAV)
+        play_wav(to_a2dp_format(SPEECH_WAV, PLAYBACK_WAV))
 
 
 # ----------------------------------------------------------------------------
@@ -429,12 +494,12 @@ def detect_headset_mac() -> "str | None":
 def bluealsa_device(mac: str) -> str:
     """ALSA device string for playing to a headset over BlueALSA A2DP.
 
-    No `plug:` wrapper: the bluealsa PCM plays Piper's 22.05 kHz mono output
-    directly (verified with `aplay -D bluealsa:DEV=...`). Prefixing `plug:`
-    breaks parsing on this bluez-alsa build - ALSA reads the comma-separated
-    args as the plug plugin's own parameters and fails with "Unknown PCM".
+    The inner PCM name is single-quoted because ALSA splits a device string
+    on commas: bare `plug:bluealsa:DEV=...,PROFILE=a2dp` is read as two
+    arguments to `plug` and fails with "Unknown parameter". Quoted, it opens
+    fine, and `plug` absorbs any residual rate/format conversion.
     """
-    return f"bluealsa:DEV={mac},PROFILE=a2dp"
+    return f"plug:'bluealsa:DEV={mac},PROFILE=a2dp'"
 
 
 def resolve_audio_device() -> "str | None":
