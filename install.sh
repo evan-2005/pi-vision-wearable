@@ -13,13 +13,14 @@
 # What this does:
 #   1. apt packages   (tesseract, bluez/bluealsa, python tooling, camera libs)
 #   2. Disables PipeWire's Bluetooth module (it fights BlueALSA for the headset)
-#   3. ~/fyp project dir + Python venv (--system-site-packages: REQUIRED so
+#   3. Stops NetworkManager's endless DHCP retry loop on eth0
+#   4. ~/fyp project dir + Python venv (--system-site-packages: REQUIRED so
 #      the apt-installed picamera2 stays importable inside the venv)
-#   4. pip packages   (ultralytics, ncnn, opencv, pytesseract, piper-tts)
-#   5. YOLOv8n download + NCNN export
-#   6. Piper voice model download (en_US-lessac-medium)
-#   7. Copies main.py into ~/fyp
-#   8. Installs a systemd service (disabled by default; see end of output)
+#   5. pip packages   (ultralytics, ncnn, opencv, pytesseract, piper-tts)
+#   6. YOLOv8n download + NCNN export
+#   7. Piper voice model download (en_US-lessac-medium)
+#   8. Copies main.py into ~/fyp
+#   9. Installs a systemd service (disabled by default; see end of output)
 #
 # What this does NOT do (one-time manual steps):
 #   - Bluetooth pairing: pair/trust/connect your headset via bluetoothctl,
@@ -36,7 +37,7 @@ log()  { echo -e "\n\033[1;32m==> $*\033[0m"; }
 warn() { echo -e "\033[1;33m[warn]\033[0m $*"; }
 
 # -----------------------------------------------------------------------------
-log "1/8 Installing apt packages"
+log "1/9 Installing apt packages"
 # -----------------------------------------------------------------------------
 sudo apt-get update
 sudo apt-get install -y \
@@ -47,7 +48,7 @@ sudo apt-get install -y \
     alsa-utils
 
 # -----------------------------------------------------------------------------
-log "2/8 Disabling PipeWire's Bluetooth handling"
+log "2/9 Disabling PipeWire's Bluetooth handling"
 # -----------------------------------------------------------------------------
 # Raspberry Pi OS ships PipeWire + WirePlumber, which claim any paired headset
 # and park it in HFP/mSBC over a SCO link as the default sink AND source. With
@@ -74,7 +75,42 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "3/8 Creating project directory and virtual environment"
+log "3/9 Stabilising eth0 addressing"
+# -----------------------------------------------------------------------------
+# eth0 is usually a direct Pi-to-laptop debug cable with no DHCP server on it.
+# NetworkManager's default (dhcp4: true) then fails and retries forever:
+#
+#   ip-config -> failed -> disconnected -> prepare -> config -> ip-config
+#
+# Every pass through 'disconnected' tears down the interface's addresses and
+# kills any SSH session over that cable - which looks exactly like the Pi
+# crashing and recovering every ~45 seconds. It is not a crash; uptime never
+# resets.
+#
+# Setting ipv6.method=link-local is the part that fixes it: it succeeds
+# immediately, so activation completes and the cycle never starts. IPv4 still
+# tries DHCP and falls back to a 169.254.x.x address when no server answers.
+# (ipv4.link-local=fallback on its own is NOT enough - the interface still
+# tore down after ~90s in testing.)
+#
+# Trade-off: plugged into a real router, eth0 gets IPv4 via DHCP but no IPv6
+# SLAAC. To restore it:  sudo nmcli connection modify <conn> ipv6.method auto
+#
+# A Pi has a single ethernet port, so the first 802-3-ethernet profile is it.
+ETH_CONN="$(nmcli -t -f NAME,TYPE connection show 2>/dev/null             | awk -F: '$2 == "802-3-ethernet" { print $1; exit }' || true)"
+if [ -n "${ETH_CONN:-}" ]; then
+    if sudo nmcli connection modify "$ETH_CONN"             ipv6.method link-local             ipv4.method auto             ipv4.link-local fallback             ipv4.dhcp-timeout 15 2>/dev/null; then
+        echo "    '$ETH_CONN' now activates without waiting on DHCP"
+        sudo nmcli connection up "$ETH_CONN" > /dev/null 2>&1 || true
+    else
+        warn "could not modify eth0 connection '$ETH_CONN'; leaving as-is"
+    fi
+else
+    echo "    no NetworkManager ethernet profile found; nothing to do"
+fi
+
+# -----------------------------------------------------------------------------
+log "4/9 Creating project directory and virtual environment"
 # -----------------------------------------------------------------------------
 mkdir -p "$FYP_DIR/voices"
 
@@ -89,7 +125,7 @@ fi
 source "$VENV/bin/activate"
 
 # -----------------------------------------------------------------------------
-log "4/8 Installing Python packages"
+log "5/9 Installing Python packages"
 # -----------------------------------------------------------------------------
 pip install --upgrade pip
 pip install \
@@ -100,7 +136,7 @@ pip install \
     "piper-tts>=1.4"
 
 # -----------------------------------------------------------------------------
-log "5/8 YOLOv8n -> NCNN export"
+log "6/9 YOLOv8n -> NCNN export"
 # -----------------------------------------------------------------------------
 cd "$FYP_DIR"
 if [ ! -d "$FYP_DIR/yolov8n_ncnn_model" ]; then
@@ -112,7 +148,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "6/8 Downloading Piper voice (en_US-lessac-medium)"
+log "7/9 Downloading Piper voice (en_US-lessac-medium)"
 # -----------------------------------------------------------------------------
 if [ ! -f "$FYP_DIR/voices/en_US-lessac-medium.onnx" ]; then
     cd "$FYP_DIR/voices"
@@ -122,7 +158,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "7/8 Installing main.py"
+log "8/9 Installing main.py"
 # -----------------------------------------------------------------------------
 if [ -f "$REPO_DIR/main.py" ]; then
     cp "$REPO_DIR/main.py" "$FYP_DIR/main.py"
@@ -131,7 +167,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "8/8 Installing systemd service (left disabled)"
+log "9/9 Installing systemd service (left disabled)"
 # -----------------------------------------------------------------------------
 sudo tee /etc/systemd/system/fyp.service > /dev/null <<EOF
 [Unit]
