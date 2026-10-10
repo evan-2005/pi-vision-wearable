@@ -100,6 +100,10 @@ OCR_MIN_CONF       = 40       # drop words tesseract is less than this % sure of
 # confidently flipping upright signs 180 degrees). Add 90/270 if the camera
 # can ever be mounted sideways; for a fixed chest mount 0 vs 180 is enough.
 OCR_ORIENTATIONS   = (0, 180)
+# Sparse-text pass (currency): scales to read at, and a looser confidence
+# floor because the keyword/denomination matcher filters noise afterwards.
+OCR_SPARSE_SCALES   = (1.0, 0.5)
+OCR_SPARSE_MIN_CONF = 30
 # Spoken when OCR finds nothing. Shared so the detection fallback can
 # tell "read something" from "read nothing" without matching a literal.
 NO_TEXT_PHRASE     = "No readable text found."
@@ -352,7 +356,7 @@ def _alnum_count(text: str) -> int:
     return sum(ch.isalnum() for ch in text)
 
 
-def ocr_scored(processed):
+def ocr_scored(processed, psm=OCR_PSM, min_conf=OCR_MIN_CONF):
     """OCR one preprocessed image; return (confidence_score, text).
 
     Uses image_to_data so we can drop low-confidence fragments (conf <
@@ -363,7 +367,7 @@ def ocr_scored(processed):
     """
     data = pytesseract.image_to_data(
         processed,
-        config=f"--psm {OCR_PSM}",
+        config=f"--psm {psm}",
         output_type=pytesseract.Output.DICT,
     )
     words, confs = [], []
@@ -372,7 +376,7 @@ def ocr_scored(processed):
             c = float(conf)
         except (TypeError, ValueError):
             continue          # tesseract uses "-1"/"" for non-text boxes
-        if c >= OCR_MIN_CONF and word.strip():
+        if c >= min_conf and word.strip():
             words.append(word)
             confs.append(c)
     return sum(confs), clean_ocr_text(" ".join(words))
@@ -408,6 +412,32 @@ def run_ocr(frame_bgr) -> str:
     print(f"[OCR] winning pass: {winning_pass}")
     print(f"[OCR] raw text: {text!r}")
     return text
+
+
+def run_ocr_sparse(frame_bgr) -> str:
+    """Find scattered text in a cluttered scene, e.g. a banknote held in view.
+
+    --psm 6 assumes one tidy block of text, so on a full frame where the
+    subject is a small part of a busy scene it returns noise. --psm 11
+    (sparse text) hunts for individual words anywhere. The frame is read at
+    two scales because small print (an issuer name) needs full resolution
+    while a large numeral reads more reliably downscaled. Words from every
+    pass are pooled so the caller can keyword-match across them.
+    """
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    pooled = []
+    for angle in OCR_ORIENTATIONS:
+        rotated = rotate_image(gray, angle)
+        for scale in OCR_SPARSE_SCALES:
+            img = rotated if scale == 1.0 else cv2.resize(
+                rotated, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            _, text = ocr_scored(clahe.apply(img), psm=11,
+                                 min_conf=OCR_SPARSE_MIN_CONF)
+            print(f"[OCR] sparse {angle:>3} deg x{scale}: {text[:60]!r}")
+            if text:
+                pooled.append(text)
+    return " ".join(pooled) if pooled else NO_TEXT_PHRASE
 
 
 # ----------------------------------------------------------------------------
@@ -570,7 +600,7 @@ def handle_currency(picam2):
     except Exception as e:
         print(f"[CURRENCY] autofocus_cycle skipped: {e}")
     frame = capture_frame(picam2)
-    text = run_ocr(frame)
+    text = run_ocr_sparse(frame)
     phrase = currency.identify("" if text == NO_TEXT_PHRASE else text)
     save_report(frame, [], phrase, "currency")
     speak(phrase)
