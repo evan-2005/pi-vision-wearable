@@ -37,6 +37,7 @@ environment variable (useful for the systemd service later):
     FYP_REPORT=0          stop writing report images
     FYP_REPORT_DIR=...    where report images go (default ~/fyp/reports)
     FYP_CAMERA_FOCAL_PX=  measured focal length, for accurate distances
+    FYP_CAMERA_ROTATION=  0/90/180/270, how far to turn frames upright
     FYP_CURRENCY=MYR      which currency to recognise
     FYP_LISTEN_SECONDS=5  how long the microphone stays open
 """
@@ -53,13 +54,12 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import pytesseract
 from picamera2 import Picamera2
 from libcamera import controls
 from ultralytics import YOLO
 
 from fypvision import distance as dist
-from fypvision import currency, emotion, finder, reporting, voice
+from fypvision import currency, emotion, finder, ocr, reporting, voice
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -92,21 +92,17 @@ DETECT_CONF        = 0.40    # min confidence for detections to be spoken
 SAVE_REPORTS       = os.environ.get("FYP_REPORT", "1") != "0"
 MAX_SPOKEN_CLASSES = 4       # don't overwhelm the listener
 
-# OCR tunables
-OCR_PSM            = 6        # tesseract page segmentation mode (assume a block)
-OCR_MIN_CONF       = 40       # drop words tesseract is less than this % sure of
-# Orientations to try when reading text. We OCR each and keep the one that
-# reads most confidently, instead of trusting Tesseract's OSD (which kept
-# confidently flipping upright signs 180 degrees). Add 90/270 if the camera
-# can ever be mounted sideways; for a fixed chest mount 0 vs 180 is enough.
-OCR_ORIENTATIONS   = (0, 180)
-# Sparse-text pass (currency): scales to read at, and a looser confidence
-# floor because the keyword/denomination matcher filters noise afterwards.
-OCR_SPARSE_SCALES   = (1.0, 0.5)
-OCR_SPARSE_MIN_CONF = 30
-# Spoken when OCR finds nothing. Shared so the detection fallback can
-# tell "read something" from "read nothing" without matching a literal.
-NO_TEXT_PHRASE     = "No readable text found."
+# The camera sits upside-down in the wearable's housing, so every frame is
+# turned the right way up at capture. Without this the detector sees inverted
+# people and furniture, and "to your left" comes out as "to your right".
+_VALID_ROTATIONS = (0, 90, 180, 270)
+_ROTATION_SETTING = os.environ.get("FYP_CAMERA_ROTATION", "180")
+if _ROTATION_SETTING in {str(r) for r in _VALID_ROTATIONS}:
+    CAMERA_ROTATION = int(_ROTATION_SETTING)
+else:
+    print(f"[CAMERA] ignoring FYP_CAMERA_ROTATION={_ROTATION_SETTING!r}; "
+          f"must be one of {_VALID_ROTATIONS}. Using 180.")
+    CAMERA_ROTATION = 180
 
 USE_GPIO_BUTTON = os.environ.get("FYP_USE_GPIO", "0") == "1"
 BUTTON_GPIO     = 17
@@ -306,141 +302,6 @@ def run_detection(frame_bgr, model):
 
 
 # ----------------------------------------------------------------------------
-# Vision - OCR
-# ----------------------------------------------------------------------------
-def preprocess_for_ocr(img_bgr):
-    """Grayscale -> upscale -> local contrast. Returns image for tesseract."""
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    return clahe.apply(gray)
-
-
-def preprocess_otsu(img_bgr):
-    """Fallback strategy: grayscale -> upscale -> Otsu threshold.
-
-    CLAHE wins on most real-world captures, but on clean high-contrast pages
-    a global Otsu binarization can recover text CLAHE's local contrast noise
-    smears out. Used only as a second pass when CLAHE comes back near-empty.
-    """
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    _, thresh = cv2.threshold(gray, 0, 255,
-                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return thresh
-
-
-_ROTATIONS = {
-    90:  cv2.ROTATE_90_CLOCKWISE,
-    180: cv2.ROTATE_180,
-    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
-}
-
-
-def rotate_image(img_bgr, angle):
-    """Rotate by a multiple of 90 degrees (0 returns the image unchanged)."""
-    if angle == 0:
-        return img_bgr
-    return cv2.rotate(img_bgr, _ROTATIONS[angle])
-
-
-def clean_ocr_text(text: str) -> str:
-    """Strip OCR junk so TTS doesn't read stray symbols."""
-    text = re.sub(r"[|{}\[\]<>_~^`]", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def _alnum_count(text: str) -> int:
-    """How many letters/digits survived - our 'is this real text?' signal."""
-    return sum(ch.isalnum() for ch in text)
-
-
-def ocr_scored(processed, psm=OCR_PSM, min_conf=OCR_MIN_CONF):
-    """OCR one preprocessed image; return (confidence_score, text).
-
-    Uses image_to_data so we can drop low-confidence fragments (conf <
-    OCR_MIN_CONF) before they reach TTS. Surviving words are rejoined in
-    reading order (the order image_to_data returns them in). The score is the
-    summed confidence of the surviving words - upright text produces many
-    confident words and scores high, so it lets us pick the right orientation.
-    """
-    data = pytesseract.image_to_data(
-        processed,
-        config=f"--psm {psm}",
-        output_type=pytesseract.Output.DICT,
-    )
-    words, confs = [], []
-    for word, conf in zip(data["text"], data["conf"]):
-        try:
-            c = float(conf)
-        except (TypeError, ValueError):
-            continue          # tesseract uses "-1"/"" for non-text boxes
-        if c >= min_conf and word.strip():
-            words.append(word)
-            confs.append(c)
-    return sum(confs), clean_ocr_text(" ".join(words))
-
-
-def _best_over_orientations(frame_bgr, preprocess, label, start_score, start):
-    """Run `preprocess` at each candidate orientation; keep the top scorer."""
-    best_score, best_text, best_pass = start_score, start[0], start[1]
-    for angle in OCR_ORIENTATIONS:
-        score, text = ocr_scored(preprocess(rotate_image(frame_bgr, angle)))
-        print(f"[OCR] {angle:>3} deg / {label}: score={score:.0f} "
-              f"text={text[:40]!r}")
-        if score > best_score:
-            best_score, best_text, best_pass = score, text, f"{angle}/{label}"
-    return best_score, best_text, best_pass
-
-
-def run_ocr(frame_bgr) -> str:
-    # Primary strategy: CLAHE at each orientation, keep the most confident read.
-    # This replaces Tesseract OSD, which kept flipping upright signs 180 deg.
-    score, text, winning_pass = _best_over_orientations(
-        frame_bgr, preprocess_for_ocr, "CLAHE", -1.0, ("", "none"))
-
-    # Fallback: if CLAHE read almost nothing, retry each orientation with a
-    # plain Otsu threshold (recovers clean high-contrast pages CLAHE smears).
-    if _alnum_count(text) < 3:
-        print("[OCR] CLAHE passes near-empty; retrying with Otsu threshold")
-        score, text, winning_pass = _best_over_orientations(
-            frame_bgr, preprocess_otsu, "Otsu", score, (text, winning_pass))
-
-    if not text:
-        return NO_TEXT_PHRASE
-    print(f"[OCR] winning pass: {winning_pass}")
-    print(f"[OCR] raw text: {text!r}")
-    return text
-
-
-def run_ocr_sparse(frame_bgr) -> str:
-    """Find scattered text in a cluttered scene, e.g. a banknote held in view.
-
-    --psm 6 assumes one tidy block of text, so on a full frame where the
-    subject is a small part of a busy scene it returns noise. --psm 11
-    (sparse text) hunts for individual words anywhere. The frame is read at
-    two scales because small print (an issuer name) needs full resolution
-    while a large numeral reads more reliably downscaled. Words from every
-    pass are pooled so the caller can keyword-match across them.
-    """
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    pooled = []
-    for angle in OCR_ORIENTATIONS:
-        rotated = rotate_image(gray, angle)
-        for scale in OCR_SPARSE_SCALES:
-            img = rotated if scale == 1.0 else cv2.resize(
-                rotated, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-            _, text = ocr_scored(clahe.apply(img), psm=11,
-                                 min_conf=OCR_SPARSE_MIN_CONF)
-            print(f"[OCR] sparse {angle:>3} deg x{scale}: {text[:60]!r}")
-            if text:
-                pooled.append(text)
-    return " ".join(pooled) if pooled else NO_TEXT_PHRASE
-
-
-# ----------------------------------------------------------------------------
 # Camera
 # ----------------------------------------------------------------------------
 def init_camera() -> Picamera2:
@@ -457,9 +318,10 @@ def init_camera() -> Picamera2:
 
 
 def capture_frame(picam2) -> "np.ndarray":
-    """Grab one frame as BGR (OpenCV order)."""
+    """Grab one frame as BGR (OpenCV order), turned the right way up."""
     rgb = picam2.capture_array("main")
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    bgr = ocr.rotate_image(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+                           CAMERA_ROTATION)
     cv2.imwrite(str(CAPTURE_JPG), bgr)   # keep last capture for debugging
     return bgr
 
@@ -533,8 +395,8 @@ def handle_short_press(picam2, model):
 
     if not detections:
         print("[DETECT] nothing recognised; falling back to OCR")
-        text = run_ocr(frame)
-        if text and text != NO_TEXT_PHRASE and looks_like_words(text):
+        text = ocr.run_ocr(frame)
+        if text != ocr.NO_TEXT_PHRASE and looks_like_words(text):
             phrase = f"No objects recognized, but I can read: {text}"
             save_report(frame, detections, phrase, "detect-ocr-fallback")
             speak(phrase)
@@ -572,7 +434,7 @@ def handle_long_press(picam2):
     except Exception as e:
         print(f"[OCR] autofocus_cycle skipped: {e}")
     frame = capture_frame(picam2)
-    text = run_ocr(frame)
+    text = ocr.run_ocr(frame)
     save_report(frame, [], text, "ocr")
     speak(text)
 
@@ -600,8 +462,8 @@ def handle_currency(picam2):
     except Exception as e:
         print(f"[CURRENCY] autofocus_cycle skipped: {e}")
     frame = capture_frame(picam2)
-    text = run_ocr_sparse(frame)
-    phrase = currency.identify("" if text == NO_TEXT_PHRASE else text)
+    text = ocr.run_ocr_sparse(frame)
+    phrase = currency.identify("" if text == ocr.NO_TEXT_PHRASE else text)
     save_report(frame, [], phrase, "currency")
     speak(phrase)
 

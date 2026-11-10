@@ -28,7 +28,7 @@ keyboard fallback for bench testing).
         ▼                                 ▼
   capture frame                     autofocus lock
   YOLOv8n (NCNN)                    capture frame
-  build phrase                     preprocess → Tesseract
+  build phrase                     find text blocks → Tesseract
         │                                 │
         └──────────────┬──────────────────┘
                        ▼
@@ -47,18 +47,25 @@ garbage on real-world captures, so the OCR path does several things:
   hunting at the moment you press the button, so the read triggers one focus
   cycle and waits for it to settle before grabbing the frame. This alone fixed
   most of the "blurry capture" failures.
-- **Orientation gating.** Tesseract's orientation detector (OSD) is happy to
-  rotate a perfectly upright image 180° when there's very little text on the
-  page (it once read "2019" as an upside-down "6LOZ"). The rotation is now only
-  applied when OSD reports enough confidence to be trusted.
-- **Two preprocessing strategies.** The primary pass upscales, then applies
-  CLAHE local contrast, which wins on most real-world captures. If that comes
-  back nearly empty, it retries once with a plain Otsu threshold, which recovers
-  clean high-contrast pages that CLAHE's local noise smears out. The winning
-  pass is logged.
-- **Confidence filtering.** Instead of dumping every character Tesseract emits,
-  the reader uses `image_to_data` and drops individual words below a confidence
-  threshold, so stray junk fragments never get spoken.
+- **Find the text first.** Handing Tesseract a whole camera frame took 20-80
+  seconds and returned noise: most of a scene is not text, and Tesseract
+  cannot read a line tilted more than about ten degrees. `fypvision/textregions.py`
+  looks for text-line-shaped blobs, groups them into blocks, and returns each
+  block cropped, rotated level and scaled to a letter size Tesseract likes.
+  Each block is then read on its own (`fypvision/ocr.py`). A page or sign
+  now reads in 2-8 seconds, level or tilted up to 45°.
+- **Upright frames.** The camera sits upside-down in the housing, so every
+  frame is rotated 180° at capture (`FYP_CAMERA_ROTATION`). If nothing reads
+  the right way up, the text-like blocks are read once more upside-down, for
+  a page held the wrong way round. Tesseract's own orientation detector is
+  not used - it once read "2019" as an upside-down "6LOZ".
+- **Confidence filtering.** The reader uses `image_to_data` and drops words
+  below a confidence threshold and stray single characters, and throws a
+  whole block away when most of what Tesseract saw in it was rejected, so
+  texture that merely looks like lettering is never spoken.
+- **Time limits.** One Tesseract call is capped at `OCR_TIMEOUT_S` and a
+  whole read at `OCR_BUDGET_S`, so a cluttered scene with no text in it
+  still answers promptly.
 
 **Speech** is Piper (the `en_US-lessac-medium` voice) rendered to a WAV and
 played through `aplay` over a BlueALSA A2DP link to a Bluetooth headset. Every
@@ -98,6 +105,11 @@ OCR while staying fast enough for detection.
 ```
 .
 ├── main.py              # the wearable: button → detect / OCR → speech
+├── fypvision/           # feature modules
+│   ├── textregions.py   #   finds blocks of text and levels them
+│   ├── ocr.py           #   reads text blocks and banknotes with Tesseract
+│   └── ...              #   distance, finder, emotion, currency, voice, reporting
+├── tests/               # pytest unit tests (run without a camera)
 ├── preview_capture.py   # dev tool: live MJPEG preview + click-to-OCR in a browser
 ├── install.sh           # one-command Pi setup (apt, venv, models, systemd unit)
 ├── .gitignore
@@ -199,17 +211,22 @@ editing code.
 | `FYP_USE_GPIO` | `0` | `1` = GPIO button, `0` = keyboard test mode |
 | `FYP_AUDIO_DEVICE` | BlueALSA A2DP | `default` routes to 3.5 mm/HDMI for bench tests |
 | `FYP_HEADSET_MAC` | your paired MAC | Bluetooth headset address |
+| `FYP_CAMERA_ROTATION` | `180` | Degrees to turn each frame so it is upright (`0` if the camera is mounted the right way up) |
 
-OCR tuning constants (in `main.py`):
+OCR tuning constants (in `fypvision/ocr.py`):
 
 | Constant | Default | Meaning |
 |----------|---------|---------|
-| `OCR_PSM` | `6` | Tesseract page-segmentation mode (assume a uniform block) |
-| `OCR_MIN_CONF` | `40` | Drop words Tesseract is less than this % sure of |
-| `OSD_MIN_CONFIDENCE` | `2.0` | Ignore orientation guesses weaker than this |
+| `OCR_PSM` | `6` | Tesseract page-segmentation mode for each text block |
+| `OCR_MIN_CONF` | `60` | Drop words Tesseract is less than this % sure of |
+| `OCR_MIN_KEPT` | `0.5` | Discard a block if fewer than this share of its words survive |
+| `OCR_TIMEOUT_S` | `8` | Cap on one Tesseract call |
+| `OCR_BUDGET_S` | `12` | Cap on a whole read |
 
-If OCR does poorly on non-block layouts (scattered signage, single lines),
-`OCR_PSM = 3` (auto) or `11` (sparse text) is the first knob to try.
+How text blocks are found (line sizes, tilt limit, target letter height) is
+tuned in `fypvision/textregions.py`.
+
+To run the unit tests (no camera needed): `python -m pytest tests`.
 
 ---
 
@@ -220,8 +237,11 @@ If OCR does poorly on non-block layouts (scattered signage, single lines),
   preflight warning when the sink is down.
 - **OCR is blurry or empty** — check `/tmp/capture.jpg` (the last capture is
   always saved there). If it's out of focus, the autofocus cycle didn't settle;
-  if it's dark, add light. The console logs which preprocessing pass won and the
-  raw recognized text.
+  if it's dark, add light. The console logs how many text blocks were found,
+  how long the read took and the raw recognized text.
+- **Left and right are swapped, or nothing is detected** — the frames are
+  upside-down. Look at `/tmp/capture.jpg`; if it is inverted, set
+  `FYP_CAMERA_ROTATION` to match how the camera is mounted.
 - **`picamera2` import fails inside the venv** — the venv must be created with
   `--system-site-packages`; `install.sh` does this, but a hand-rolled venv
   won't have it.
@@ -232,7 +252,9 @@ If OCR does poorly on non-block layouts (scattered signage, single lines),
 
 - English only for now (single Piper voice, Latin-script OCR).
 - OCR assumes reasonably flat, reasonably lit text — it's an assistive reader,
-  not a document scanner.
+  not a document scanner. Text seen at a steep angle (perspective, not just
+  tilt), text tilted past 45°, and a lone one- or two-character sign such as a
+  bus number are not read.
 - Detection vocabulary is the COCO class set that ships with YOLOv8n.
 
 Planned next steps: barcode/currency modes, a distance cue for detected
