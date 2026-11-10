@@ -1,0 +1,15 @@
+# This project is written on Windows but runs on a Raspberry Pi, and files are
+# copied from the working tree straight to the Pi. With core.autocrlf=true a
+# checkout would rewrite them to CRLF, and a shell script with CRLF fails on
+# Linux with "bad interpreter: /usr/bin/env bash^M". Force LF everywhere so
+# the working tree is always what the Pi will run.
+* text=auto eol=lf
+
+# Never touch binaries: models and report images must pass through unchanged.
+*.jpg  binary
+*.jpeg binary
+*.png  binary
+*.onnx binary
+*.bin  binary
+*.pt   binary
+*.zip  binary
