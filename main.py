@@ -2,9 +2,11 @@
 """
 FYP Assistive Vision Wearable - Main Pipeline
 ==============================================
-Short trigger  -> scene detection (YOLOv8n/NCNN) -> spoken summary
+Single press   -> scene detection (YOLOv8n/NCNN) -> spoken summary with
+                  the nearest object's bearing and distance
                   (falls back to OCR when nothing is recognised)
-Long trigger   -> OCR (Tesseract) -> spoken text
+Double press   -> OCR (Tesseract) -> spoken text
+Long press     -> voice command through the headset microphone
 
 Additional modes, reachable by voice or from the keyboard:
     detection with distance and bearing for the nearest object
@@ -32,6 +34,8 @@ Configuration is via the constants below, each overridable by an
 environment variable (useful for the systemd service later):
 
     FYP_USE_GPIO=1        use the GPIO button instead of the keyboard
+    FYP_BUTTON_ACTIVE=    low/high/auto: pin level when the button is pressed
+    FYP_LONG_PRESS=voice  what a long press does: voice or read
     FYP_AUDIO_DEVICE=...  override the aplay output device
     FYP_HEADSET_MAC=...   override the Bluetooth headset MAC
     FYP_REPORT=0          stop writing report images
@@ -59,7 +63,8 @@ from libcamera import controls
 from ultralytics import YOLO
 
 from fypvision import distance as dist
-from fypvision import currency, emotion, finder, ocr, reporting, voice
+from fypvision import (button, currency, emotion, finder, ocr, reporting,
+                       voice)
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -106,7 +111,16 @@ else:
 
 USE_GPIO_BUTTON = os.environ.get("FYP_USE_GPIO", "0") == "1"
 BUTTON_GPIO     = 17
-HOLD_TIME_S     = 1.0        # press longer than this = long press (OCR)
+# Level of the pin while the button is pressed. "auto" reads the idle level
+# at start-up, which covers both a bare switch to ground and the 3-pin button
+# modules (some pull their output high when pressed, some low).
+BUTTON_ACTIVE   = os.environ.get("FYP_BUTTON_ACTIVE", "auto").lower()
+if BUTTON_ACTIVE not in ("auto", "low", "high"):
+    print(f"[GPIO] ignoring FYP_BUTTON_ACTIVE={BUTTON_ACTIVE!r}; using auto")
+    BUTTON_ACTIVE = "auto"
+# What a long press does: "voice" opens the microphone, "read" reads text
+# (for a headset with no usable microphone).
+LONG_PRESS_ACTION = os.environ.get("FYP_LONG_PRESS", "voice").lower()
 
 # Bluetooth headset fallback MAC (Nothing Ear (a)); used only when auto-detect
 # can't find a connected headset. Override with FYP_HEADSET_MAC.
@@ -249,13 +263,16 @@ def extract_detections(results, frame_shape) -> list:
         if conf < DETECT_CONF:
             continue
         label = names[int(box.cls[0])]
-        x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
+        coords = tuple(float(v) for v in box.xyxy[0])
+        estimate = dist.estimate_distance(label, coords, width, height)
         detections.append({
             "label": label,
             "conf": conf,
-            "box": (x1, y1, x2, y2),
-            "distance_m": dist.estimate_distance_m(label, y2 - y1,
-                                                   width, height),
+            "box": coords,
+            "distance_m": estimate.metres if estimate else None,
+            # True when the object runs out of frame: it is no farther
+            # than distance_m, and probably nearer.
+            "distance_is_max": bool(estimate and estimate.is_upper_bound),
         })
     return detections
 
@@ -271,10 +288,8 @@ def build_detection_phrase(detections, frame_width: int) -> str:
         return "Nothing recognized ahead."
 
     counts = Counter(d["label"] for d in detections)
-    parts = []
-    for cls, n in counts.most_common(MAX_SPOKEN_CLASSES):
-        label = cls if n == 1 else cls + "s"   # naive plural, fine for COCO
-        parts.append(f"{n} {label}")
+    parts = [f"{n} {cls if n == 1 else finder.plural(cls)}"
+             for cls, n in counts.most_common(MAX_SPOKEN_CLASSES)]
 
     if len(parts) == 1:
         listing = parts[0]
@@ -288,7 +303,9 @@ def build_detection_phrase(detections, frame_width: int) -> str:
         x1, _, x2, _ = nearest["box"]
         phrase += (f" Nearest {nearest['label']} "
                    f"{dist.describe_direction((x1 + x2) / 2.0, frame_width)}, "
-                   f"{dist.describe_distance(nearest['distance_m'])}.")
+                   + dist.describe_distance(nearest["distance_m"],
+                                            nearest["distance_is_max"])
+                   + ".")
     return phrase
 
 
@@ -410,7 +427,9 @@ def handle_find_object(picam2, model, target_phrase: str):
     """Look for one named object and report bearing and distance."""
     target = finder.normalise_target(target_phrase)
     if not target:
-        speak(f"I cannot look for {target_phrase}.")
+        # Not echoed back: over voice, target_phrase is the whole sentence.
+        print(f"[FIND] no detectable object in {target_phrase!r}")
+        speak("I cannot look for that. Try a bottle, a chair or a person.")
         return
 
     speak(f"Looking for {target}.")
@@ -489,14 +508,15 @@ def handle_voice(picam2, model):
 
     Recording holds an HFP/SCO link to the headset, which cannot coexist
     with A2DP playback, so speak() is never called while the mic is open -
-    voice.record() closes the link and settles before returning.
+    voice.record() closes the link and settles before returning. There is
+    no spoken "listening" prompt for the same reason: the cue to talk is a
+    beep that voice.record() plays once the mic is really live.
     """
     if not voice.available():
         speak("Voice input is not set up.")
         return
 
     mac = detect_headset_mac() or HEADSET_MAC
-    speak("Listening.")
     said = voice.listen(mac)
     if not said:
         speak("I did not hear anything.")
@@ -541,27 +561,28 @@ def keyboard_loop(picam2, model):
 
 
 def gpio_loop(picam2, model):
-    from gpiozero import Button
     from signal import pause
 
-    button = Button(BUTTON_GPIO, pull_up=True, hold_time=HOLD_TIME_S)
-    state = {"held": False}
+    if LONG_PRESS_ACTION == "read":
+        def on_long():
+            guarded(handle_long_press, picam2)
+    else:
+        def on_long():
+            guarded(handle_voice, picam2, model)
 
-    def on_held():
-        state["held"] = True
-        guarded(handle_long_press, picam2)
-
-    def on_released():
-        if state["held"]:
-            state["held"] = False    # long press already handled
-        else:
-            guarded(handle_short_press, picam2, model)
-
-    button.when_held = on_held
-    button.when_released = on_released
-    print(f"[GPIO] listening on GPIO{BUTTON_GPIO} "
-          f"(short press = detect, hold {HOLD_TIME_S}s = OCR)")
-    pause()
+    classifier = button.PressClassifier(
+        on_single=lambda: guarded(handle_short_press, picam2, model),
+        on_double=lambda: guarded(handle_long_press, picam2),
+        on_long=on_long)
+    # Keep the reference: gpiozero stops watching a Button once it is
+    # garbage-collected.
+    watched = button.watch(BUTTON_GPIO, classifier, BUTTON_ACTIVE)
+    print(f"[GPIO] press = detect, double press = read text, "
+          f"hold {button.HOLD_TIME_S}s = {LONG_PRESS_ACTION}")
+    try:
+        pause()
+    finally:
+        watched.close()
 
 
 # ----------------------------------------------------------------------------

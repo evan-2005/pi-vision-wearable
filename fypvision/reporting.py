@@ -70,9 +70,10 @@ def annotate(frame_bgr, detections, phrase: str = ""):
                           zip(det["box"], (scale_x, scale_y, scale_x, scale_y)))
         cv2.rectangle(img, (x1, y1), (x2, y2), BOX_COLOUR, 2)
 
-        label = f"{det['label']} {det.get('conf', 0):.2f}"
+        label = f"{det['label'] or 'face'} {det.get('conf', 0):.2f}"
         if det.get("distance_m"):
-            label += f"  ~{det['distance_m']:.1f}m"
+            bound = "<" if det.get("distance_is_max") else "~"
+            label += f"  {bound}{det['distance_m']:.1f}m"
         (tw, th), _ = cv2.getTextSize(label, FONT, 0.55, 2)
         cv2.rectangle(img, (x1, max(0, y1 - th - 8)),
                       (x1 + tw + 8, y1), BOX_COLOUR, -1)

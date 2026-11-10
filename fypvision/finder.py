@@ -28,22 +28,38 @@ _SYNONYMS = {
     "keyboard": "keyboard", "mouse": "mouse", "remote": "remote",
     "tv": "tv", "television": "tv", "monitor": "tv", "screen": "tv",
     "book": "book", "clock": "clock", "scissors": "scissors",
-    "door": "door", "plant": "potted plant",
+    "plant": "potted plant",
     "person": "person", "people": "person", "someone": "person",
     "somebody": "person", "man": "person", "woman": "person",
+    "anyone": "person", "anybody": "person", "who": "person",
     "dog": "dog", "cat": "cat", "bird": "bird",
     "car": "car", "bus": "bus", "bicycle": "bicycle", "bike": "bicycle",
     "motorcycle": "motorcycle", "truck": "truck", "train": "train",
     "bench": "bench", "bed": "bed", "toilet": "toilet", "sink": "sink",
     "fridge": "refrigerator", "refrigerator": "refrigerator",
     "microwave": "microwave", "oven": "oven", "umbrella": "umbrella",
-    "keys": "keys", "wallet": "wallet",
 }
 
 # Filler words to strip before matching, so "where is the bottle" works.
 _STOPWORDS = {"a", "an", "the", "my", "your", "our", "is", "are", "where",
               "find", "locate", "look", "for", "me", "please", "can", "you",
-              "s", "of", "some", "any", "there"}
+              "s", "of", "some", "any", "there", "how", "far", "away",
+              "near", "close"}
+
+
+# COCO class names whose plural is not just "+s".
+_IRREGULAR_PLURALS = {
+    "person": "people", "mouse": "mice", "knife": "knives", "bus": "buses",
+    "bench": "benches", "couch": "couches", "sandwich": "sandwiches",
+    "wine glass": "wine glasses", "toothbrush": "toothbrushes",
+    "scissors": "pairs of scissors", "skis": "pairs of skis",
+    "sheep": "sheep",
+}
+
+
+def plural(label: str) -> str:
+    """Spoken plural of a class name: "people", not "persons"."""
+    return _IRREGULAR_PLURALS.get(label, label + "s")
 
 
 def normalise_target(spoken: str):
@@ -85,9 +101,10 @@ def find_in_detections(detections, target: str, frame_width: int,
     best = min(matches, key=proximity)
     x1, _, x2, _ = best["box"]
     bearing = describe_direction((x1 + x2) / 2.0, frame_width)
-    distance = describe_distance(best.get("distance_m"))
+    distance = describe_distance(best.get("distance_m"),
+                                 best.get("distance_is_max", False))
 
     where = bearing + (f", {distance}" if distance else "")
     if len(matches) > 1:
-        return f"{len(matches)} {target}s in view. Nearest is {where}."
+        return f"{len(matches)} {plural(target)} in view. Nearest is {where}."
     return f"{target.capitalize()} {where}."

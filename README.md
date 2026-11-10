@@ -1,10 +1,15 @@
 # Pi Vision Wearable
 
 An offline, wearable assistive-vision aid for people who are blind or have low
-vision, built on a Raspberry Pi 5. One button does two jobs:
+vision, built on a Raspberry Pi 5. One button does three jobs:
 
-- **Short press** — describes what's in front of you ("2 people and a chair ahead").
-- **Long press** — reads printed text out loud (signs, labels, a page of a book).
+- **Press** — describes what's in front of you, with the nearest object's
+  direction and distance ("2 people and 1 chair ahead. Nearest person to your
+  left, about 2 metres.").
+- **Double press** — reads printed text out loud (signs, labels, a page of a book).
+- **Hold** — listens for a spoken command through the headset (speak after
+  the beep; it stops listening when you stop talking): "where is my
+  bottle", "how does she look", "what note is this", "read this".
 
 Everything runs on the device. There's no internet dependency, no cloud service,
 and no image ever leaves the Pi. That was a hard requirement for me: the thing a
@@ -23,7 +28,7 @@ keyboard fallback for bench testing).
    button ──────▶│  main.py     │
                  │  (dispatcher)│
                  └──────┬───────┘
-        short press     │      long press (hold ≥ 1s)
+          press         │      double press
         ┌───────────────┴────────────────┐
         ▼                                 ▼
   capture frame                     autofocus lock
@@ -80,7 +85,7 @@ SSH painless.
 |------|-------|
 | Raspberry Pi 5 | Runs the whole pipeline on CPU; no accelerator needed |
 | Camera Module 3 | Autofocus is used directly by the OCR path |
-| Momentary push button | Wired GPIO17 → GND, internal pull-up |
+| Push button | Bare switch (GPIO17 → GND) or a 3-pin button module; see *Wiring the button* |
 | Bluetooth headset | A2DP; bone-conduction works well so ambient hearing stays open |
 | Power bank | Any USB-C PD bank that can feed a Pi 5 |
 
@@ -186,7 +191,27 @@ FYP_AUDIO_DEVICE=default python3 main.py
 
 ### On the wearable
 
-With `FYP_USE_GPIO=1`, a short press runs detection and holding the button for
+With `FYP_USE_GPIO=1` the button takes over from the keyboard: press to detect,
+double press to read text, hold for 0.8 s to give a voice command. A press is
+acted on 0.4 s after release, the time it takes to be sure it is not the first
+half of a double press. Set `FYP_LONG_PRESS=read` to make holding read text
+instead, for a headset with no usable microphone.
+
+### Wiring the button
+
+A bare push button goes between GPIO17 (pin 11) and any GND pin.
+
+A 3-pin button module (GND / VCC / OUT, sometimes labelled G / V / S) is wired:
+
+| Module pin | Pi pin |
+|------------|--------|
+| GND | GND (pin 9) |
+| VCC (middle) | **3.3 V (pin 1)** — never 5 V: the output would put 5 V on a GPIO pin, which damages the Pi |
+| OUT / S | GPIO17 (pin 11) |
+
+Some modules pull their output high when pressed and some low. `main.py` works
+out which at start-up from the pin's resting level, so **do not hold the button
+while the program starts**. To force it, set `FYP_BUTTON_ACTIVE=low` or `high`.
 more than a second runs OCR.
 
 ### Run as a service
@@ -209,6 +234,9 @@ editing code.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `FYP_USE_GPIO` | `0` | `1` = GPIO button, `0` = keyboard test mode |
+| `FYP_BUTTON_ACTIVE` | `auto` | Pin level when pressed: `low`, `high`, or detect at start-up |
+| `FYP_LONG_PRESS` | `voice` | What holding the button does: `voice` or `read` |
+| `FYP_CAMERA_FOCAL_PX` | from the lens (982) | Measured focal length in pixels, for more accurate distances |
 | `FYP_AUDIO_DEVICE` | BlueALSA A2DP | `default` routes to 3.5 mm/HDMI for bench tests |
 | `FYP_HEADSET_MAC` | your paired MAC | Bluetooth headset address |
 | `FYP_CAMERA_ROTATION` | `180` | Degrees to turn each frame so it is upright (`0` if the camera is mounted the right way up) |
@@ -227,6 +255,20 @@ How text blocks are found (line sizes, tilt limit, target letter height) is
 tuned in `fypvision/textregions.py`.
 
 To run the unit tests (no camera needed): `python -m pytest tests`.
+
+### Distance accuracy and calibration
+
+Distance comes from how large a recognised object looks, given a typical real
+size for its class (`fypvision/distance.py`). Expect roughly ±20%: people and
+chairs come in different sizes. An object that runs out of the frame cannot be
+measured, so it is reported as a limit instead ("within about 2 metres").
+
+To remove the lens part of the error, measure the focal length once: stand an
+object of known height `H` metres upright in the middle of the view at a known
+distance `D` metres, run a detection, read its box height `h` in pixels off the
+report image (at the full 2304-pixel width), and set
+
+    FYP_CAMERA_FOCAL_PX = h × D / H
 
 ---
 
@@ -257,8 +299,13 @@ To run the unit tests (no camera needed): `python -m pytest tests`.
   bus number are not read.
 - Detection vocabulary is the COCO class set that ships with YOLOv8n.
 
-Planned next steps: barcode/currency modes, a distance cue for detected
-obstacles, and a lighter wake-word alternative to the physical button.
+- Voice commands are matched against a fixed list of phrases; anything else
+  is answered with "I did not catch that" rather than guessed at.
+- Expression reading is a hint, not a fact: it needs a face at least 40 pixels
+  wide, roughly facing the camera.
+
+Planned next steps: a barcode mode and a lighter wake-word alternative to the
+physical button.
 
 ---
 

@@ -14,6 +14,7 @@ stays deliberately hedged ("looks happy", never "is happy"), and anything
 below CONFIDENCE_FLOOR is reported as uncertain rather than guessed at.
 """
 
+import math
 import os
 from pathlib import Path
 
@@ -32,6 +33,12 @@ FACE_SCORE_THRESHOLD = 0.75   # YuNet detection confidence
 CONFIDENCE_FLOOR = 0.40       # below this, say "unclear" instead of guessing
 FER_INPUT_SIZE = 64           # FER+ expects 64x64 greyscale
 MAX_FACES_SPOKEN = 3
+# FER+ was trained on crops a little looser than YuNet's box, which stops at
+# the hairline and chin; the crop side is the box's longer side times this.
+FACE_CROP_MARGIN = 1.1
+# A face narrower than this many pixels has too little detail left to read
+# an expression from; it is reported as too far away instead of guessed at.
+MIN_FACE_PX = 40
 
 _face_detector = None
 _emotion_net = None
@@ -67,21 +74,46 @@ def _softmax(x):
     return exp / exp.sum()
 
 
-def _classify(face_bgr):
-    """(emotion, confidence) for one cropped face."""
-    grey = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
-    resized = cv2.resize(grey, (FER_INPUT_SIZE, FER_INPUT_SIZE),
-                         interpolation=cv2.INTER_AREA)
+def _aligned_face(frame_bgr, face) -> np.ndarray:
+    """Square greyscale crop of one YuNet face, eyes level, FER+ sized.
+
+    A chest-worn camera sees heads tilted and off-square. FER+ only ever saw
+    upright, centred faces, so the crop is rotated about the face centre
+    until the line between the eyes is horizontal.
+    """
+    x, y, w, h = (float(v) for v in face[:4])
+    right_eye_x, right_eye_y, left_eye_x, left_eye_y = (
+        float(v) for v in face[4:8])
+    roll = math.degrees(math.atan2(left_eye_y - right_eye_y,
+                                   left_eye_x - right_eye_x))
+    scale = FER_INPUT_SIZE / (FACE_CROP_MARGIN * max(w, h))
+    centre = (x + w / 2.0, y + h / 2.0)
+    matrix = cv2.getRotationMatrix2D(centre, roll, scale)
+    matrix[:, 2] += (FER_INPUT_SIZE / 2.0 - centre[0],
+                     FER_INPUT_SIZE / 2.0 - centre[1])
+    crop = cv2.warpAffine(frame_bgr, matrix, (FER_INPUT_SIZE, FER_INPUT_SIZE),
+                          flags=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC,
+                          borderMode=cv2.BORDER_REPLICATE)
+    return cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+
+def _classify(face_grey) -> tuple:
+    """(emotion, confidence, runner-up) for one aligned 64x64 face."""
     # FER+ takes raw 0-255 intensities, not a 0-1 normalised blob.
-    blob = resized.astype(np.float32).reshape(1, 1, FER_INPUT_SIZE, FER_INPUT_SIZE)
+    blob = face_grey.astype(np.float32).reshape(
+        1, 1, FER_INPUT_SIZE, FER_INPUT_SIZE)
     _emotion_net.setInput(blob)
     probabilities = _softmax(_emotion_net.forward()[0])
-    index = int(np.argmax(probabilities))
-    return EMOTIONS[index], float(probabilities[index])
+    first, second = (int(i) for i in np.argsort(probabilities)[::-1][:2])
+    return (EMOTIONS[first], float(probabilities[first]),
+            f"{EMOTIONS[second]} {probabilities[second]:.2f}")
 
 
 def detect_faces(frame_bgr) -> list:
-    """Faces with expressions: [{box, emotion, conf, face_score}, ...]."""
+    """Faces with expressions: [{box, label, conf, face_score}, ...].
+
+    `label` is None for a face too small to read an expression from.
+    """
     if not _load():
         return []
 
@@ -99,17 +131,19 @@ def detect_faces(frame_bgr) -> list:
         w, h = min(w, width - x), min(h, height - y)
         if w <= 0 or h <= 0:
             continue
-        crop = frame_bgr[y:y + h, x:x + w]
-        if crop.size == 0:
-            continue
-        try:
-            emotion, confidence = _classify(crop)
-        except Exception as e:
-            print(f"[EMOTION] classification failed: {e}")
-            continue
+        label, confidence = None, 0.0
+        if min(w, h) >= MIN_FACE_PX:
+            try:
+                label, confidence, runner_up = _classify(
+                    _aligned_face(frame_bgr, face))
+                print(f"[EMOTION] face {w}x{h}: {label} {confidence:.2f} "
+                      f"(then {runner_up})")
+            except Exception as e:
+                print(f"[EMOTION] classification failed: {e}")
+                continue
         results.append({
             "box": (x, y, x + w, y + h),
-            "label": emotion,
+            "label": label,
             "conf": confidence,
             "face_score": float(face[-1]),
         })
@@ -128,13 +162,17 @@ def describe(faces: list) -> str:
 
     parts = []
     for face in ordered:
-        if face["conf"] < CONFIDENCE_FLOOR:
+        if face["label"] is None:
+            parts.append("someone too far away to read")
+        elif face["conf"] < CONFIDENCE_FLOOR:
             parts.append("someone whose expression I cannot read")
         else:
             parts.append(f"someone who looks {face['label']}")
 
-    if len(faces) == 1:
+    if len(parts) == 1 and len(faces) == 1:
         # Not str.capitalize(): it lowercases the rest, turning "I" into "i".
         return parts[0][0].upper() + parts[0][1:] + "."
     listing = ", ".join(parts[:-1]) + " and " + parts[-1]
+    if len(faces) > len(parts):
+        return f"{len(faces)} faces. The nearest are {listing}."
     return f"{len(faces)} faces: {listing}."
