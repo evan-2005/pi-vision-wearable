@@ -10,6 +10,10 @@ vision, built on a Raspberry Pi 5. One button does three jobs:
 - **Hold** — listens for a spoken command through the headset (speak after
   the beep; it stops listening when you stop talking): "where is my
   bottle", "how does she look", "what note is this", "read this".
+- **Keep holding for 5 seconds** — says "Shutting down" and powers the Pi off
+  safely. Give it about ten seconds before unplugging.
+
+Power it on, switch the headset on, and it says "Ready" when it can be heard.
 
 Everything runs on the device. There's no internet dependency, no cloud service,
 and no image ever leaves the Pi. That was a hard requirement for me: the thing a
@@ -113,6 +117,8 @@ OCR while staying fast enough for detection.
 ├── fypvision/           # feature modules
 │   ├── textregions.py   #   finds blocks of text and levels them
 │   ├── ocr.py           #   reads text blocks and banknotes with Tesseract
+│   ├── audio.py         #   picks the connected headset for each utterance
+│   ├── button.py        #   single / double / long press and the power-off hold
 │   └── ...              #   distance, finder, emotion, currency, voice, reporting
 ├── tests/               # pytest unit tests (run without a camera)
 ├── preview_capture.py   # dev tool: live MJPEG preview + click-to-OCR in a browser
@@ -146,7 +152,8 @@ bash install.sh
 4. Downloads YOLOv8n and exports it to NCNN (runs on-device, a few minutes).
 5. Downloads the Piper voice model.
 6. Copies `main.py` into `~/fyp`.
-7. Installs a `systemd` service, left **disabled** until the button is wired.
+7. Installs a `systemd` service, left **disabled** until the button is wired,
+   and a sudoers rule that lets it power the Pi off.
 
 ### Pair the Bluetooth headset (one-time)
 
@@ -161,8 +168,9 @@ connect <MAC>
 exit
 ```
 
-Put the MAC in the service unit (`FYP_HEADSET_MAC`) or edit the default in
-`main.py`.
+There is no MAC to configure: speech goes to whichever paired headset is
+connected at that moment, so the headset can be switched on after the Pi, or
+swapped for another paired one.
 
 ---
 
@@ -180,6 +188,10 @@ cd ~/fyp && source venv/bin/activate && python3 main.py
 ```
 ENTER          → scene detection
 l  then ENTER  → OCR / read text
+e  then ENTER  → facial expression
+c  then ENTER  → banknote
+v  then ENTER  → voice command through the headset
+f bottle       → find a named object
 q  then ENTER  → quit
 ```
 
@@ -195,7 +207,8 @@ With `FYP_USE_GPIO=1` the button takes over from the keyboard: press to detect,
 double press to read text, hold for 0.8 s to give a voice command. A press is
 acted on 0.4 s after release, the time it takes to be sure it is not the first
 half of a double press. Set `FYP_LONG_PRESS=read` to make holding read text
-instead, for a headset with no usable microphone.
+instead, for a headset with no usable microphone. Holding on for 5 s in
+total powers the Pi off (the voice prompt it opened on the way is dropped).
 
 ### Wiring the button
 
@@ -212,7 +225,6 @@ A 3-pin button module (GND / VCC / OUT, sometimes labelled G / V / S) is wired:
 Some modules pull their output high when pressed and some low. `main.py` works
 out which at start-up from the pin's resting level, so **do not hold the button
 while the program starts**. To force it, set `FYP_BUTTON_ACTIVE=low` or `high`.
-more than a second runs OCR.
 
 ### Run as a service
 
@@ -222,6 +234,10 @@ Once the button is wired (GPIO17 ↔ GND) and tested:
 sudo systemctl enable --now fyp.service
 journalctl -u fyp.service -f      # live logs
 ```
+
+From then on the wearable starts by itself on every power-on. The service
+turns report images off (`FYP_REPORT=0`) so daily use does not fill the SD
+card; run `main.py` by hand when you want them for the write-up.
 
 ---
 
@@ -238,7 +254,11 @@ editing code.
 | `FYP_LONG_PRESS` | `voice` | What holding the button does: `voice` or `read` |
 | `FYP_CAMERA_FOCAL_PX` | from the lens (982) | Measured focal length in pixels, for more accurate distances |
 | `FYP_AUDIO_DEVICE` | BlueALSA A2DP | `default` routes to 3.5 mm/HDMI for bench tests |
-| `FYP_HEADSET_MAC` | your paired MAC | Bluetooth headset address |
+| `FYP_HEADSET_MAC` | none | Headset to try when no connected one is detected; normally not needed |
+| `FYP_REPORT` | `1` | `0` stops saving report images (the service sets this) |
+| `FYP_REPORT_DIR` | `~/fyp/reports` | Where report images go |
+| `FYP_CURRENCY` | `MYR` | Which currency to recognise |
+| `FYP_LISTEN_SECONDS` | `5` | Longest the microphone stays open |
 | `FYP_CAMERA_ROTATION` | `180` | Degrees to turn each frame so it is upright (`0` if the camera is mounted the right way up) |
 
 OCR tuning constants (in `fypvision/ocr.py`):
@@ -275,8 +295,12 @@ report image (at the full 2304-pixel width), and set
 ## Troubleshooting
 
 - **No speech, but console prints the text** — the headset isn't connected.
-  `bluetoothctl info <MAC>` should say `Connected: yes`. `main.py` prints a
-  preflight warning when the sink is down.
+  `bluetoothctl devices Connected` should list it; the log shows
+  `[AUDIO] no headset connected; not spoken`. It says "Ready" by itself once
+  the headset is back.
+- **Holding the button does not power off** — the log shows
+  `[SHUTDOWN] poweroff failed`; re-run `install.sh`, which adds the sudoers
+  rule that allows it.
 - **OCR is blurry or empty** — check `/tmp/capture.jpg` (the last capture is
   always saved there). If it's out of focus, the autofocus cycle didn't settle;
   if it's dark, add light. The console logs how many text blocks were found,

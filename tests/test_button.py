@@ -20,7 +20,9 @@ class Recorder:
             on_single=lambda: self._add("single"),
             on_double=lambda: self._add("double"),
             on_long=lambda: self._add("long"),
-            double_press_s=WINDOW_S)
+            double_press_s=WINDOW_S,
+            on_shutdown=lambda: self._add("shutdown"),
+            shutdown_after_held_s=WINDOW_S)
 
     def _add(self, gesture):
         with self._lock:
@@ -63,6 +65,19 @@ def test_hold_is_a_long_press_and_its_release_is_ignored(recorder):
     recorder.classifier.released()
 
     assert recorder.settle() == ["long"]
+
+
+def test_holding_on_past_a_long_press_shuts_down(recorder):
+    recorder.classifier.held()
+
+    assert recorder.settle() == ["long", "shutdown"]
+
+
+def test_releasing_a_long_press_in_time_does_not_shut_down(recorder):
+    recorder.classifier.held()
+    recorder.classifier.released()
+
+    assert "shutdown" not in recorder.settle()
 
 
 def test_press_then_hold_is_just_a_long_press(recorder):

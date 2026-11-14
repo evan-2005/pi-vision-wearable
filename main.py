@@ -7,6 +7,7 @@ Single press   -> scene detection (YOLOv8n/NCNN) -> spoken summary with
                   (falls back to OCR when nothing is recognised)
 Double press   -> OCR (Tesseract) -> spoken text
 Long press     -> voice command through the headset microphone
+Hold 5 seconds -> say "Shutting down" and power the Pi off cleanly
 
 Additional modes, reachable by voice or from the keyboard:
     detection with distance and bearing for the nearest object
@@ -37,7 +38,7 @@ environment variable (useful for the systemd service later):
     FYP_BUTTON_ACTIVE=    low/high/auto: pin level when the button is pressed
     FYP_LONG_PRESS=voice  what a long press does: voice or read
     FYP_AUDIO_DEVICE=...  override the aplay output device
-    FYP_HEADSET_MAC=...   override the Bluetooth headset MAC
+    FYP_HEADSET_MAC=...   headset to try when none is detected (optional)
     FYP_REPORT=0          stop writing report images
     FYP_REPORT_DIR=...    where report images go (default ~/fyp/reports)
     FYP_CAMERA_FOCAL_PX=  measured focal length, for accurate distances
@@ -63,8 +64,8 @@ from libcamera import controls
 from ultralytics import YOLO
 
 from fypvision import distance as dist
-from fypvision import (button, currency, emotion, finder, ocr, reporting,
-                       voice)
+from fypvision import (audio, button, currency, emotion, finder, ocr,
+                       reporting, voice)
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -122,19 +123,20 @@ if BUTTON_ACTIVE not in ("auto", "low", "high"):
 # (for a headset with no usable microphone).
 LONG_PRESS_ACTION = os.environ.get("FYP_LONG_PRESS", "voice").lower()
 
-# Bluetooth headset fallback MAC (Nothing Ear (a)); used only when auto-detect
-# can't find a connected headset. Override with FYP_HEADSET_MAC.
-HEADSET_MAC = os.environ.get("FYP_HEADSET_MAC", "3C:B0:ED:B6:18:A9")
-
-# Audio output device for aplay, resolved at startup by resolve_audio_device().
+# Speech goes to whichever Bluetooth headset is connected at the moment it is
+# spoken (see fypvision/audio.py) - the Pi usually boots before the headset is
+# switched on, so nothing is decided at start-up.
+# FYP_AUDIO_DEVICE overrides that; "default" forces the onboard 3.5mm/HDMI
+# output for bench tests. FYP_HEADSET_MAC is an optional address to try when
+# no connected headset is detected.
 # Speech is converted to 44.1 kHz stereo before playback - Piper's native
 # 22.05 kHz mono triggers a BlueALSA mono-SBC bug; see to_a2dp_format().
-# Priority: FYP_AUDIO_DEVICE override > whichever headset is connected
-# (auto-detected) > HEADSET_MAC fallback. This lets the user swap between
-# paired earphones - whichever is powered on and connected gets used.
-# Set FYP_AUDIO_DEVICE=default to force the onboard 3.5mm/HDMI output.
 _AUDIO_OVERRIDE = os.environ.get("FYP_AUDIO_DEVICE")
-AUDIO_DEVICE = None   # resolved in main() before any speech
+HEADSET_MAC = os.environ.get("FYP_HEADSET_MAC", "")
+
+HEADSET_POLL_S   = 2.0   # how often to check whether the headset is there
+# A2DP is not playable the instant the headset reports "connected".
+HEADSET_SETTLE_S = 3.0
 
 # Target playback format. 44.1 kHz stereo is the universally safe A2DP/SBC
 # configuration; see to_a2dp_format() for why mono is not an option.
@@ -213,12 +215,16 @@ def to_a2dp_format(src: Path, dst: Path) -> Path:
 
 
 def play_wav(path: Path) -> bool:
-    """Play a WAV on AUDIO_DEVICE. Returns True on success."""
+    """Play a WAV on the current output device. Returns True on success."""
+    device = audio.output_device(_AUDIO_OVERRIDE, HEADSET_MAC)
+    if device is None:
+        print("[AUDIO] no headset connected; not spoken")
+        return False
     # No -q: aplay's rate/format warnings are the only signal that a stream is
     # being played at the wrong rate, and suppressing them hid a real bug.
     cmd = ["aplay"]
-    if AUDIO_DEVICE:
-        cmd += ["-D", AUDIO_DEVICE]
+    if device:
+        cmd += ["-D", device]
     cmd.append(str(path))
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=60)
@@ -347,6 +353,7 @@ def capture_frame(picam2) -> "np.ndarray":
 # Triggers
 # ----------------------------------------------------------------------------
 _busy = threading.Lock()
+_shutting_down = threading.Event()
 
 
 def guarded(fn, *args) -> None:
@@ -357,7 +364,7 @@ def guarded(fn, *args) -> None:
     Any handler crash is reported by voice so a headless user isn't left
     wondering, then logged to the console.
     """
-    if not _busy.acquire(blocking=False):
+    if _shutting_down.is_set() or not _busy.acquire(blocking=False):
         print("[BUSY] ignoring trigger while previous task is running")
         return
     try:
@@ -516,8 +523,13 @@ def handle_voice(picam2, model):
         speak("Voice input is not set up.")
         return
 
-    mac = detect_headset_mac() or HEADSET_MAC
+    mac = audio.detect_headset_mac() or HEADSET_MAC
+    if not mac:
+        print("[VOICE] no headset connected; cannot listen")
+        return
     said = voice.listen(mac)
+    if _shutting_down.is_set():
+        return      # the hold that opened the mic turned into a shutdown
     if not said:
         speak("I did not hear anything.")
         return
@@ -525,6 +537,48 @@ def handle_voice(picam2, model):
     intent, argument = voice.parse_intent(said)
     print(f"[VOICE] intent={intent} from {said!r}")
     dispatch_intent(intent, argument, picam2, model)
+
+
+def handle_shutdown():
+    """Power the Pi off cleanly; pulling the plug risks the SD card.
+
+    Reached by holding the button well past a long press, so the voice
+    handler that the same hold started is usually still listening: wait for
+    it rather than talk over the open microphone.
+    """
+    _shutting_down.set()
+    with _busy:
+        speak("Shutting down.")
+        try:
+            # Allowed without a password by the sudoers rule install.sh adds.
+            result = subprocess.run(["sudo", "-n", "systemctl", "poweroff"],
+                                    capture_output=True, timeout=30, text=True)
+            failure = result.stderr.strip() if result.returncode else ""
+        except (OSError, subprocess.SubprocessError) as e:
+            failure = str(e)
+        if failure:
+            print(f"[SHUTDOWN] poweroff failed: {failure}")
+            _shutting_down.clear()
+            speak("Sorry, I could not shut down.")
+
+
+def announce_headset():
+    """Say "Ready." each time an output device appears.
+
+    The wearer has no screen: this is how they learn the device has booted
+    and can be heard, and that a headset which dropped out is back.
+    """
+    was_available = False
+    while True:
+        available = audio.output_device(_AUDIO_OVERRIDE,
+                                        HEADSET_MAC) is not None
+        if available and not was_available:
+            if _AUDIO_OVERRIDE is None:
+                time.sleep(HEADSET_SETTLE_S)
+            with _busy:
+                speak("Ready.")
+        was_available = available
+        time.sleep(HEADSET_POLL_S)
 
 
 def keyboard_loop(picam2, model):
@@ -573,12 +627,14 @@ def gpio_loop(picam2, model):
     classifier = button.PressClassifier(
         on_single=lambda: guarded(handle_short_press, picam2, model),
         on_double=lambda: guarded(handle_long_press, picam2),
-        on_long=on_long)
+        on_long=on_long,
+        on_shutdown=handle_shutdown)
     # Keep the reference: gpiozero stops watching a Button once it is
     # garbage-collected.
     watched = button.watch(BUTTON_GPIO, classifier, BUTTON_ACTIVE)
     print(f"[GPIO] press = detect, double press = read text, "
-          f"hold {button.HOLD_TIME_S}s = {LONG_PRESS_ACTION}")
+          f"hold {button.HOLD_TIME_S}s = {LONG_PRESS_ACTION}, "
+          f"hold {button.SHUTDOWN_HOLD_S}s = power off")
     try:
         pause()
     finally:
@@ -588,76 +644,7 @@ def gpio_loop(picam2, model):
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
-def bluetooth_connected(mac: str) -> bool:
-    """True if bluetoothctl reports the headset as connected."""
-    try:
-        result = subprocess.run(
-            ["bluetoothctl", "info", mac],
-            capture_output=True, timeout=10, text=True,
-        )
-        return "Connected: yes" in result.stdout
-    except Exception:
-        return False
-
-
-def detect_headset_mac() -> "str | None":
-    """MAC of a currently-connected Bluetooth device, or None.
-
-    Lets the user swap between paired headsets without editing config:
-    whichever one is powered on and connected is the one we use. On a
-    wearable the only paired device is the headset, so "connected" == it.
-    """
-    try:
-        result = subprocess.run(
-            ["bluetoothctl", "devices", "Connected"],
-            capture_output=True, timeout=10, text=True,
-        )
-        # Lines look like: "Device 3C:B0:ED:B6:18:A9 Nothing Ear (a)"
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 2 and parts[0] == "Device":
-                return parts[1]
-    except Exception:
-        pass  # old bluez without the "Connected" filter, or bluetoothctl absent
-    return None
-
-
-def bluealsa_device(mac: str) -> str:
-    """ALSA device string for playing to a headset over BlueALSA A2DP.
-
-    The inner PCM name is single-quoted because ALSA splits a device string
-    on commas: bare `plug:bluealsa:DEV=...,PROFILE=a2dp` is read as two
-    arguments to `plug` and fails with "Unknown parameter". Quoted, it opens
-    fine, and `plug` absorbs any residual rate/format conversion.
-    """
-    return f"plug:'bluealsa:DEV={mac},PROFILE=a2dp'"
-
-
-def resolve_audio_device() -> "str | None":
-    """Pick the ALSA device speech plays through, in priority order.
-
-    1. FYP_AUDIO_DEVICE override ("default"/"none"/"" -> onboard 3.5mm/HDMI).
-    2. Whichever Bluetooth headset is currently connected (auto-detected).
-    3. HEADSET_MAC fallback, so it still tries if detection is unavailable.
-    """
-    if _AUDIO_OVERRIDE is not None:
-        if _AUDIO_OVERRIDE.lower() in ("default", "none", ""):
-            return None
-        return _AUDIO_OVERRIDE
-    mac = detect_headset_mac()
-    if mac:
-        print(f"[AUDIO] using connected headset {mac}")
-        return bluealsa_device(mac)
-    print(f"[AUDIO] no connected headset detected; "
-          f"falling back to {HEADSET_MAC}")
-    return bluealsa_device(HEADSET_MAC)
-
-
 def main():
-    # Resolve the audio sink before anything tries to speak.
-    global AUDIO_DEVICE
-    AUDIO_DEVICE = resolve_audio_device()
-
     # --- preflight ---
     problems = []
     if not MODEL_PATH.exists():
@@ -671,15 +658,6 @@ def main():
             print(f"[PREFLIGHT] {p}")
         sys.exit(1)
 
-    # Warn (don't abort) if the Bluetooth sink isn't up: audio would go
-    # nowhere, but keyboard-mode bench testing may deliberately use 3.5mm.
-    if AUDIO_DEVICE and "bluealsa" in AUDIO_DEVICE:
-        mac_match = re.search(r"DEV=([0-9A-Fa-f:]+)", AUDIO_DEVICE)
-        target_mac = mac_match.group(1) if mac_match else HEADSET_MAC
-        if not bluetooth_connected(target_mac):
-            print(f"[PREFLIGHT] WARNING: headset {target_mac} not connected;"
-                  " speech will fail until it reconnects.")
-
     print("[INIT] loading YOLO NCNN model...")
     model = YOLO(str(MODEL_PATH), task="detect")
 
@@ -690,7 +668,8 @@ def main():
     print("[INIT] warmup inference...")
     model.predict(capture_frame(picam2), imgsz=640, verbose=False)
 
-    speak("Ready.")
+    threading.Thread(target=announce_headset, daemon=True,
+                     name="announce-headset").start()
 
     try:
         if USE_GPIO_BUTTON:

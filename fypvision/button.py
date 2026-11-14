@@ -5,6 +5,11 @@ The wearable has a single button, so the gesture is the whole interface:
     single press   the everyday action (describe the scene)
     double press   a second action that must work without speech (read text)
     long press     open the microphone for a spoken command
+    keep holding   power the device off (SHUTDOWN_HOLD_S in total)
+
+The power-off hold passes through a long press on the way, so the long-press
+action has already started by the time it fires; the caller's shutdown
+handler has to cope with that.
 
 A single press cannot be acted on the instant the button comes up, because
 it may be the first half of a double press; it fires once DOUBLE_PRESS_S has
@@ -17,16 +22,17 @@ a real pin.
 
 import threading
 import time
-from typing import Callable
+from typing import Callable, Optional
 
 DOUBLE_PRESS_S = 0.40     # max gap between the two presses of a double press
 HOLD_TIME_S = 0.80        # holding this long is a long press
+SHUTDOWN_HOLD_S = 5.0     # holding this long powers the device off
 BOUNCE_TIME_S = 0.03      # contact chatter shorter than this is ignored
 _PROBE_SETTLE_S = 0.05
 
 
 class PressClassifier:
-    """Calls one of three callbacks per gesture, each on its own thread.
+    """Calls one callback per gesture, each on its own thread.
 
     The callbacks may take seconds (they capture, think and speak), so they
     never run on the caller's thread: the GPIO library must stay free to
@@ -36,10 +42,14 @@ class PressClassifier:
     def __init__(self, on_single: Callable[[], None],
                  on_double: Callable[[], None],
                  on_long: Callable[[], None],
-                 double_press_s: float = DOUBLE_PRESS_S):
+                 double_press_s: float = DOUBLE_PRESS_S,
+                 on_shutdown: Optional[Callable[[], None]] = None,
+                 shutdown_after_held_s: float = SHUTDOWN_HOLD_S - HOLD_TIME_S):
         self._actions = {"single": on_single, "double": on_double,
-                         "long": on_long}
+                         "long": on_long, "shutdown": on_shutdown}
         self._double_press_s = double_press_s
+        self._shutdown_after_held_s = shutdown_after_held_s
+        self._shutdown_timer = None   # runs while a long press is still down
         self._lock = threading.Lock()
         self._pending = None          # timer waiting to confirm a single press
         self._long_in_progress = False
@@ -60,11 +70,19 @@ class PressClassifier:
             if self._pending is not None:      # press-then-hold: just a hold
                 self._pending.cancel()
                 self._pending = None
+            if self._actions["shutdown"] is not None:
+                self._shutdown_timer = threading.Timer(
+                    self._shutdown_after_held_s, self._fire, ["shutdown"])
+                self._shutdown_timer.daemon = True
+                self._shutdown_timer.start()
         self._fire("long")
 
     def released(self) -> None:
         """The button has come up."""
         with self._lock:
+            if self._shutdown_timer is not None:
+                self._shutdown_timer.cancel()
+                self._shutdown_timer = None
             if self._long_in_progress:
                 self._long_in_progress = False     # end of a long press
                 return

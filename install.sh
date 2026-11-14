@@ -23,8 +23,8 @@
 #   9. Installs a systemd service (disabled by default; see end of output)
 #
 # What this does NOT do (one-time manual steps):
-#   - Bluetooth pairing: pair/trust/connect your headset via bluetoothctl,
-#     then put its MAC in fyp.service (FYP_HEADSET_MAC) or main.py.
+#   - Bluetooth pairing: pair/trust/connect your headset via bluetoothctl.
+#     Whichever paired headset is connected gets used; no MAC to configure.
 #   - Enabling the service: do that only after the GPIO button is wired.
 # =============================================================================
 set -euo pipefail
@@ -256,16 +256,30 @@ Type=simple
 User=$USER
 WorkingDirectory=$FYP_DIR
 Environment=FYP_USE_GPIO=1
-# Set your paired headset MAC here (or edit the default in main.py):
-Environment=FYP_HEADSET_MAC=3C:B0:ED:B6:18:A9
+# Without this Python buffers its output and journalctl lags behind.
+Environment=PYTHONUNBUFFERED=1
+# Report images are for the write-up; in daily use they would fill the card.
+Environment=FYP_REPORT=0
 ExecStart=$VENV/bin/python $FYP_DIR/main.py
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
 sudo systemctl daemon-reload
+
+# Holding the button for 5 seconds powers the Pi off. The service does not run
+# as root, so allow that one command - and nothing else - without a password.
+SUDOERS_TMP="$(mktemp)"
+echo "$USER ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff" > "$SUDOERS_TMP"
+if sudo visudo -cf "$SUDOERS_TMP" > /dev/null; then
+    sudo install -m 0440 -o root -g root "$SUDOERS_TMP" /etc/sudoers.d/fyp-poweroff
+    echo "    button-hold power-off enabled"
+else
+    warn "sudoers rule failed validation; button-hold power-off will not work"
+fi
+rm -f "$SUDOERS_TMP"
 
 # -----------------------------------------------------------------------------
 echo
@@ -283,8 +297,7 @@ Manual steps remaining (one-time):
          trust <MAC>        # required for auto-reconnect after reboot
          connect <MAC>
          exit
-     Then set the MAC in /etc/systemd/system/fyp.service (FYP_HEADSET_MAC)
-     if it differs from the default.
+     Any paired headset that is switched on is used automatically.
 
   2. Bench test (keyboard mode, no button needed):
          cd ~/fyp && source venv/bin/activate && python3 main.py
@@ -292,5 +305,7 @@ Manual steps remaining (one-time):
   3. Once the GPIO button is wired (GPIO17 <-> GND) and tested:
          sudo systemctl enable --now fyp.service
          journalctl -u fyp.service -f      # live logs
+     The Pi then starts the wearable on every power-on and says "Ready"
+     when the headset connects. Hold the button 5 seconds to power off.
 
 DONE
