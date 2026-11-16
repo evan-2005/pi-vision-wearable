@@ -92,6 +92,7 @@ SSH painless.
 | Push button | Bare switch (GPIO17 → GND) or a 3-pin button module; see *Wiring the button* |
 | Bluetooth headset | A2DP; bone-conduction works well so ambient hearing stays open |
 | Power bank | Any USB-C PD bank that can feed a Pi 5 |
+| Intel RealSense D435i (optional) | Measures distance instead of estimating it; plug into a blue USB 3 port. See *Distance accuracy and calibration* |
 
 Capture resolution is 2304×1296, chosen as a compromise that's sharp enough for
 OCR while staying fast enough for detection.
@@ -119,6 +120,7 @@ OCR while staying fast enough for detection.
 │   ├── ocr.py           #   reads text blocks and banknotes with Tesseract
 │   ├── audio.py         #   picks the connected headset for each utterance
 │   ├── button.py        #   single / double / long press and the power-off hold
+│   ├── depth.py         #   measured distance from an optional RealSense D435i
 │   └── ...              #   distance, finder, emotion, currency, voice, reporting
 ├── tests/               # pytest unit tests (run without a camera)
 ├── preview_capture.py   # dev tool: live MJPEG preview + click-to-OCR in a browser
@@ -260,6 +262,9 @@ editing code.
 | `FYP_CURRENCY` | `MYR` | Which currency to recognise |
 | `FYP_LISTEN_SECONDS` | `5` | Longest the microphone stays open |
 | `FYP_CAMERA_ROTATION` | `180` | Degrees to turn each frame so it is upright (`0` if the camera is mounted the right way up) |
+| `FYP_DEPTH_OFFSET_X`, `FYP_DEPTH_OFFSET_Y` | `0` | Depth-camera alignment, in depth-image pixels (see calibration below) |
+| `FYP_DEPTH_ROTATION` | `0` | `180` if the depth camera is mounted upside-down |
+| `FYP_DEPTH_HFOV` | `87` | Horizontal field of view of the depth image, in degrees |
 
 OCR tuning constants (in `fypvision/ocr.py`):
 
@@ -289,6 +294,22 @@ distance `D` metres, run a detection, read its box height `h` in pixels off the
 report image (at the full 2304-pixel width), and set
 
     FYP_CAMERA_FOCAL_PX = h × D / H
+
+**With a RealSense D435i plugged in**, detection and object finding use its
+measured depth instead, for any object and not only the classes with a known
+size (`fypvision/depth.py`). Nothing needs switching on: the depth image is
+taken alongside the picture, and whenever there is none (camera unplugged, or
+a hole in the reading from glass, sunlight or anything nearer than about
+0.3 m) the size-based estimate above is used as before. The console says
+which one was used (`[DEPTH] measured` or `[DEPTH] none; estimating from
+size`). The depth image is read with `v4l2-ctl`, so `pyrealsense2` is not
+needed. Check the camera on its own with `python -m fypvision.depth`.
+
+The two cameras must be fixed side by side, facing the same way. If they are
+not perfectly parallel, set `FYP_DEPTH_OFFSET_X` / `FYP_DEPTH_OFFSET_Y`: put
+one object about a metre straight ahead of the Camera Module, and enter how
+many pixels right and down of centre it appears in the 848×480 depth image.
+A depth reading adds about a second per detection on a USB 2 port.
 
 ---
 

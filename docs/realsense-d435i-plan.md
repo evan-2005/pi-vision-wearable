@@ -94,6 +94,12 @@ Rules to keep it that way:
 
 ## Software changes
 
+> **Status, 16 Nov 2026:** `depth.py`, its tests and the `main.py` hook are in.
+> `pyrealsense2` has no build for the Pi's Python 3.13, so depth is read from
+> the camera's V4L2 node with `v4l2-ctl` instead; no udev rule or sudo needed.
+> The measured path lives in `depth.py`, not `distance.py`. Still open: the
+> power measurements, a rigid mount, alignment calibration and the soak test.
+
 | File | Change |
 |---|---|
 | `fypvision/depth.py` (new) | Open D435i, grab a median of a few depth frames, close. `available()` returns False when the camera or library is missing, like `voice.available()`. |

@@ -45,7 +45,7 @@ sudo apt-get install -y \
     tesseract-ocr libtesseract-dev \
     bluez bluez-alsa-utils \
     unzip curl \
-    python3-picamera2 rpicam-apps \
+    python3-picamera2 rpicam-apps v4l-utils \
     alsa-utils
 
 # -----------------------------------------------------------------------------

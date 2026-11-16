@@ -43,6 +43,8 @@ environment variable (useful for the systemd service later):
     FYP_REPORT_DIR=...    where report images go (default ~/fyp/reports)
     FYP_CAMERA_FOCAL_PX=  measured focal length, for accurate distances
     FYP_CAMERA_ROTATION=  0/90/180/270, how far to turn frames upright
+    FYP_DEPTH_OFFSET_X/Y= depth-camera alignment in depth pixels (see README)
+    FYP_DEPTH_ROTATION=   180 if the depth camera is mounted upside-down
     FYP_CURRENCY=MYR      which currency to recognise
     FYP_LISTEN_SECONDS=5  how long the microphone stays open
 """
@@ -55,6 +57,7 @@ import threading
 import time
 import wave
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -64,7 +67,7 @@ from libcamera import controls
 from ultralytics import YOLO
 
 from fypvision import distance as dist
-from fypvision import (audio, button, currency, emotion, finder, ocr,
+from fypvision import (audio, button, currency, depth, emotion, finder, ocr,
                        reporting, voice)
 
 # ----------------------------------------------------------------------------
@@ -254,7 +257,7 @@ def speak(text: str) -> None:
 # ----------------------------------------------------------------------------
 # Vision - detection
 # ----------------------------------------------------------------------------
-def extract_detections(results, frame_shape) -> list:
+def extract_detections(results, frame_shape, depth_mm=None) -> list:
     """YOLO results -> plain dicts, one per confident detection.
 
     Everything downstream (phrasing, finding, distance, report drawing)
@@ -270,7 +273,8 @@ def extract_detections(results, frame_shape) -> list:
             continue
         label = names[int(box.cls[0])]
         coords = tuple(float(v) for v in box.xyxy[0])
-        estimate = dist.estimate_distance(label, coords, width, height)
+        # Measured by the depth camera when there is one, else from box size.
+        estimate = depth.range_for(depth_mm, label, coords, width, height)
         detections.append({
             "label": label,
             "conf": conf,
@@ -315,12 +319,31 @@ def build_detection_phrase(detections, frame_width: int) -> str:
     return phrase
 
 
-def run_detection(frame_bgr, model):
+_depth_pool = ThreadPoolExecutor(max_workers=1)
+
+
+def start_depth_grab():
+    """Begin reading the depth camera in the background.
+
+    It takes about a second, so it runs alongside the picture and the
+    detector instead of in front of them.
+    """
+    return _depth_pool.submit(depth.grab)
+
+
+def run_detection(frame_bgr, model, depth_pending=None):
     """Returns (spoken phrase, detections)."""
     t0 = time.time()
     results = model.predict(frame_bgr, imgsz=640, verbose=False)
     print(f"[DETECT] inference {(time.time() - t0) * 1000:.0f} ms")
-    detections = extract_detections(results, frame_bgr.shape)
+    depth_mm = None
+    if depth_pending is not None:
+        try:
+            depth_mm = depth_pending.result()
+        except Exception as e:      # depth is a bonus; never lose the answer to it
+            print(f"[DEPTH] {type(e).__name__}: {e}")
+        print("[DEPTH] measured" if depth_mm is not None else "[DEPTH] none; estimating from size")
+    detections = extract_detections(results, frame_bgr.shape, depth_mm)
     return build_detection_phrase(detections, frame_bgr.shape[1]), detections
 
 
@@ -414,8 +437,9 @@ def handle_short_press(picam2, model):
     answer they were actually after.
     """
     speak("Detecting.")
+    depth_pending = start_depth_grab()
     frame = capture_frame(picam2)
-    phrase, detections = run_detection(frame, model)
+    phrase, detections = run_detection(frame, model, depth_pending)
 
     if not detections:
         print("[DETECT] nothing recognised; falling back to OCR")
@@ -440,8 +464,9 @@ def handle_find_object(picam2, model, target_phrase: str):
         return
 
     speak(f"Looking for {target}.")
+    depth_pending = start_depth_grab()
     frame = capture_frame(picam2)
-    _, detections = run_detection(frame, model)
+    _, detections = run_detection(frame, model, depth_pending)
     phrase = finder.find_in_detections(detections, target, frame.shape[1],
                                        dist.describe_direction,
                                        dist.describe_distance)
